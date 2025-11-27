@@ -1199,8 +1199,22 @@ build_driver_iso() {
     
     # Create ISO
     local ISO_NAME="rcraid-${DRIVER_VERSION}-${KVERS}.iso"
-    genisoimage -o "$HOME/$ISO_NAME" -R -J -V "RCRAID_DUD" $DUD_DIR 2>/dev/null || \
-    mkisofs -o "$HOME/$ISO_NAME" -R -J -V "RCRAID_DUD" $DUD_DIR
+    
+    # Find an ISO creation tool
+    local ISO_TOOL=""
+    if which genisoimage >/dev/null 2>&1; then
+        ISO_TOOL="genisoimage"
+    elif which mkisofs >/dev/null 2>&1; then
+        ISO_TOOL="mkisofs"
+    else
+        print_error "No ISO creation tool found!"
+        echo "Please install genisoimage: sudo dnf install genisoimage"
+        rm -rf $DUD_DIR
+        return 1
+    fi
+    
+    print_status "Creating ISO with $ISO_TOOL..."
+    $ISO_TOOL -o "$HOME/$ISO_NAME" -R -J -V "RCRAID_DUD" $DUD_DIR
     
     rm -rf $DUD_DIR
     
