@@ -1,0 +1,18 @@
+=================================================================
+RAIDCore LINUX SDK README
+AMD-RAID RAIDXpert2 LINUX SDK README
+
+Copyright (c) 2006.  Broadcom Corporation.  All rights reserved.
+Copyright (c) 2006-2008 Ciprico Inc.  All rights reserved.
+Copyright (c) 2008-2013 Dot Hill Systems Corp.  All rights reserved.
+Copyright (c) 2017-2024 Advanced Micro Devices Inc.  All rights reserved.
+=================================================================
+
+Ubuntu:
+For detailed instructions on how to install Ubuntu, please refer to the AMD-RAID(TM) Quick Start Guide for Ubuntu Operating Systems, document number 56966
+
+RHEL:
+For detailed instructions on how to install RHEL, please refer to the AMD-RAID(TM) Quick Start Guide for Red Hat (RHEL) Operating System, document number 56963
+
+Product Version: 9.3.3
+Product Build: 9.3.3-00122

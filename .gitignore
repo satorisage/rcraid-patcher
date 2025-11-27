@@ -1,0 +1,42 @@
+# Build artifacts
+*.o
+*.ko
+*.ko.xz
+*.mod
+*.mod.c
+*.mod.o
+.*.cmd
+.*.d
+.tmp_versions/
+Module.symvers
+Modules.symvers
+modules.order
+Module.markers
+
+# Backup files
+*.orig
+*.bak
+*~
+
+# Certificates (sensitive - don't commit)
+driver_sdk/certs/
+/var/lib/rccert/
+
+# RPM build
+rpmbuild/
+*.rpm
+*.iso
+
+# Temporary files
+/tmp/
+*.tmp
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
