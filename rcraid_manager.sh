@@ -8,7 +8,7 @@ set -e
 
 # Configuration
 DRIVER_NAME="rcraid"
-DRIVER_VERSION="9.3.3.00122"
+DRIVER_VERSION="9.3.3"
 KVERS=$(uname -r)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DRIVER_SDK_DIR="$SCRIPT_DIR/driver_sdk"
@@ -1011,7 +1011,7 @@ restore_original_files() {
 build_driver_rpm() {
     print_status "Building Driver Update Disk RPM..."
     
-    local RELEASE="1"
+    local RELEASE="5.14.0.611.5.1.el9_7.x86_64"
     local ARCH="x86_64"
     local BUILD_ROOT="$HOME/rpmbuild"
     local MODULE_PATH=""
@@ -1042,6 +1042,7 @@ build_driver_rpm() {
     dnf install -y rpm-build rpmdevtools createrepo_c genisoimage 2>/dev/null || true
     
     # Setup RPM build environment
+    rm -f $BUILD_ROOT/RPMS/x86_64/kmod-rcraid*.rpm 2>/dev/null || true
     print_status "Setting up RPM build environment..."
     rpmdev-setuptree 2>/dev/null || mkdir -p $BUILD_ROOT/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
     
@@ -1059,6 +1060,15 @@ build_driver_rpm() {
     tar czf $BUILD_ROOT/SOURCES/${DRIVER_NAME}-${DRIVER_VERSION}.tar.gz $TARBALL_DIR
     rm -rf /tmp/$TARBALL_DIR
     cd - > /dev/null
+
+    # Generate kernel module dependencies
+    print_status "Generating kernel symbol dependencies..."
+    local KSYM_REQUIRES=""
+    if [ -f "$MODULE_PATH" ]; then
+        KSYM_REQUIRES=$(modprobe --dump-modversions "$MODULE_PATH" 2>/dev/null | \
+            awk '{printf "Requires: kernel(%s) = 0x%s\n", $2, substr($1, 3)}' | \
+            sort -u)
+    fi
     
     # Create spec file
     print_status "Creating RPM spec file..."
@@ -1073,22 +1083,29 @@ build_driver_rpm() {
 
 Name:           kmod-%{kmod_name}
 Version:        %{kmod_version}
-Release:        ${RELEASE}%{?dist}
-Summary:        AMD RAIDXpert2 driver for RHEL/Alma 9.x
-License:        Proprietary
+Release:        ${RELEASE}
+Summary:        AMD RAID driver for RHEL 9.7
+License:        Dot Hill
 Group:          System Environment/Kernel
-URL:            https://www.amd.com
+URL:            http://www.kernel.org
 
 Source0:        %{kmod_name}-%{kmod_version}.tar.gz
 
-Requires:       kernel >= 5.14.0
+Requires:       /usr/sbin/depmod
+Requires:       /usr/sbin/weak-modules
+${KSYM_REQUIRES}
+
 Provides:       kmod(%{kmod_name}) = %{version}
+Provides:       kmod(%{kmod_name}.ko)
+Provides:       kernel-modules >= %{kernel_version}
+Provides:       %{kmod_name}-kmod = %{version}-%{release}
+Provides:       modalias(pci:v00001022d000043BDsv*sd*bc*sc*i*)
+Provides:       modalias(pci:v00001022d00007905sv*sd*bc*sc*i*)
+Provides:       modalias(pci:v00001022d0000791[67]sv*sd*bc*sc*i*)
+Provides:       modalias(pci:v00001022d0000B000sv*sd*bc01sc08i02*)
 
 %description
-AMD RAIDXpert2 (rcraid) kernel driver for AMD RAID controllers.
-Patched for RHEL/Alma 9.6+ kernel compatibility.
-
-This package provides the rcraid kernel module for kernel %{kernel_version}.
+This package provides the rcraid kernel modules built for the Linux kernel 5.14.0-427.13.1.el9_4.x86_64 for the x86_64 family of processors.
 
 %prep
 %setup -q -n %{kmod_name}-%{kmod_version}
@@ -1116,11 +1133,26 @@ rcraid
 MODLOAD
 
 %post
-depmod -a %{kernel_version} 2>/dev/null || :
-dracut -f --kver %{kernel_version} 2>/dev/null || :
+if [ -e "/boot/System.map-%{kernel_version}" ]; then
+    /usr/sbin/depmod -aeF "/boot/System.map-%{kernel_version}" "%{kernel_version}" > /dev/null || :
+fi
+modules=( \$(find /lib/modules/%{kernel_version}/extra/%{kmod_name} | grep -E '\.ko(\.gz|\.bz2|\.xz|\.zst)?\$') )
+if [ -x "/usr/sbin/weak-modules" ]; then
+    printf '%s\\n' "\${modules[@]}" | /usr/sbin/weak-modules --add-modules
+fi
+
+%preun
+rpm -ql kmod-%{kmod_name}-%{version}-%{release}.%{_arch} | grep -E '\.ko(\.gz|\.bz2|\.xz|\.zst)?\$' > /var/run/rpm-kmod-%{kmod_name}-modules
 
 %postun
-depmod -a %{kernel_version} 2>/dev/null || :
+if [ -e "/boot/System.map-%{kernel_version}" ]; then
+    /usr/sbin/depmod -aeF "/boot/System.map-%{kernel_version}" "%{kernel_version}" > /dev/null || :
+fi
+modules=( \$(cat /var/run/rpm-kmod-%{kmod_name}-modules) )
+rm /var/run/rpm-kmod-%{kmod_name}-modules
+if [ -x "/usr/sbin/weak-modules" ]; then
+    printf '%s\\n' "\${modules[@]}" | /usr/sbin/weak-modules --remove-modules
+fi
 
 %files
 %defattr(-,root,root,-)
@@ -1190,7 +1222,7 @@ build_driver_iso() {
     cp "$RPM_FILE" $DUD_DIR/rpms/x86_64/
     
     # Create rhdd3 file (identifies this as a driver disk)
-    echo "AMD rcraid Driver Update Disk" > $DUD_DIR/rhdd3
+    echo -e "Driver Update Disk version 3\n" > $DUD_DIR/rhdd3
     
     # Create repo metadata
     cd $DUD_DIR/rpms/x86_64
