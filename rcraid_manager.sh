@@ -336,6 +336,15 @@ check_secure_boot() {
 }
 
 find_installed_module() {
+    # First try modinfo - this is the most accurate source
+    if command -v modinfo &> /dev/null; then
+        local modinfo_path=$(modinfo -n rcraid 2>/dev/null)
+        if [ -n "$modinfo_path" ] && [ -f "$modinfo_path" ]; then
+            echo "$modinfo_path"
+            return 0
+        fi
+    fi
+    
     # Check various locations for installed module
     # This includes weak-modules symlinks which point to modules built for other kernels
     local locations=(
@@ -365,6 +374,14 @@ find_installed_module() {
         fi
     done
     
+    # Check for weak-updates with full path structure (RHEL style)
+    # e.g., /lib/modules/CURRENT/weak-updates/lib/modules/ORIGINAL/extra/rcraid/rcraid.ko
+    local weak_full=$(find "/lib/modules/$KVERS/weak-updates" -name "rcraid.ko" 2>/dev/null | head -1)
+    if [ -n "$weak_full" ] && [ -f "$weak_full" ]; then
+        echo "$weak_full"
+        return 0
+    fi
+    
     # Check DKMS
     local dkms_module=$(find /var/lib/dkms/rcraid -name "rcraid.ko" 2>/dev/null | head -1)
     if [ -n "$dkms_module" ]; then
@@ -380,8 +397,47 @@ find_module_info() {
     local module_path=""
     local module_source=""
     local is_weak_module=0
+    local built_for_kernel=""
     
-    # Check weak-updates first (this is where symlinks from other kernels appear)
+    # First try modinfo - most accurate
+    if command -v modinfo &> /dev/null; then
+        module_path=$(modinfo -n rcraid 2>/dev/null)
+        if [ -n "$module_path" ] && [ -f "$module_path" ]; then
+            # Check if it's in weak-updates
+            if [[ "$module_path" == *"/weak-updates/"* ]]; then
+                is_weak_module=1
+                # Extract the original kernel version from the path
+                # Path like: /lib/modules/CURRENT/weak-updates/lib/modules/ORIGINAL/extra/rcraid/rcraid.ko
+                built_for_kernel=$(echo "$module_path" | grep -oP 'weak-updates/lib/modules/\K[^/]+')
+                module_source="$module_path"
+            else
+                module_source="$module_path"
+            fi
+            
+            echo "path:$module_path"
+            echo "source:$module_source"
+            echo "weak:$is_weak_module"
+            [ -n "$built_for_kernel" ] && echo "built_for:$built_for_kernel"
+            return 0
+        fi
+    fi
+    
+    # Fallback: Check weak-updates with full path structure
+    local weak_full=$(find "/lib/modules/$KVERS/weak-updates" -name "rcraid.ko" 2>/dev/null | head -1)
+    if [ -n "$weak_full" ] && [ -f "$weak_full" ]; then
+        module_path="$weak_full"
+        module_source="$weak_full"
+        is_weak_module=1
+        built_for_kernel=$(echo "$weak_full" | grep -oP 'weak-updates/lib/modules/\K[^/]+')
+        
+        echo "path:$module_path"
+        echo "source:$module_source"
+        echo "weak:$is_weak_module"
+        [ -n "$built_for_kernel" ] && echo "built_for:$built_for_kernel"
+        return 0
+    fi
+    
+    # Check standard weak-updates symlinks
     local weak_locations=(
         "/lib/modules/$KVERS/weak-updates/rcraid.ko"
         "/lib/modules/$KVERS/weak-updates/rcraid/rcraid.ko"
@@ -394,38 +450,35 @@ find_module_info() {
                 module_path="$loc"
                 module_source="$real_path"
                 is_weak_module=1
-                break
+                built_for_kernel=$(echo "$real_path" | grep -oP '(?<=/lib/modules/)[^/]+')
+                
+                echo "path:$module_path"
+                echo "source:$module_source"
+                echo "weak:$is_weak_module"
+                [ -n "$built_for_kernel" ] && echo "built_for:$built_for_kernel"
+                return 0
             fi
         fi
     done
     
-    # If not found in weak-updates, check regular locations
-    if [ -z "$module_path" ]; then
-        local regular_locations=(
-            "/lib/modules/$KVERS/extra/rcraid.ko"
-            "/lib/modules/$KVERS/extra/rcraid/rcraid.ko"
-            "/lib/modules/$KVERS/extra/rcraid.ko.xz"
-            "/lib/modules/$KVERS/extra/rcraid/rcraid.ko.xz"
-            "/lib/modules/$KVERS/updates/rcraid.ko"
-            "/lib/modules/$KVERS/updates/rcraid.ko.xz"
-        )
-        
-        for loc in "${regular_locations[@]}"; do
-            if [ -f "$loc" ]; then
-                module_path="$loc"
-                module_source="$loc"
-                break
-            fi
-        done
-    fi
+    # Check regular locations
+    local regular_locations=(
+        "/lib/modules/$KVERS/extra/rcraid.ko"
+        "/lib/modules/$KVERS/extra/rcraid/rcraid.ko"
+        "/lib/modules/$KVERS/extra/rcraid.ko.xz"
+        "/lib/modules/$KVERS/extra/rcraid/rcraid.ko.xz"
+        "/lib/modules/$KVERS/updates/rcraid.ko"
+        "/lib/modules/$KVERS/updates/rcraid.ko.xz"
+    )
     
-    # Output results
-    if [ -n "$module_path" ]; then
-        echo "path:$module_path"
-        echo "source:$module_source"
-        echo "weak:$is_weak_module"
-        return 0
-    fi
+    for loc in "${regular_locations[@]}"; do
+        if [ -f "$loc" ]; then
+            echo "path:$loc"
+            echo "source:$loc"
+            echo "weak:0"
+            return 0
+        fi
+    done
     
     return 1
 }
@@ -2081,32 +2134,40 @@ show_system_status() {
     # Installed module status with weak-modules detection
     local module_info=$(find_module_info)
     if [ -n "$module_info" ]; then
-        local mod_path=$(echo "$module_info" | grep "^path:" | cut -d: -f2)
-        local mod_source=$(echo "$module_info" | grep "^source:" | cut -d: -f2)
+        local mod_path=$(echo "$module_info" | grep "^path:" | cut -d: -f2-)
+        local mod_source=$(echo "$module_info" | grep "^source:" | cut -d: -f2-)
         local is_weak=$(echo "$module_info" | grep "^weak:" | cut -d: -f2)
+        local built_for=$(echo "$module_info" | grep "^built_for:" | cut -d: -f2)
         
         if [ "$is_weak" = "1" ]; then
             echo -e "Installed:      ${GREEN}YES${NC} (via weak-modules)"
-            echo -e "  Symlink:      $mod_path"
-            echo -e "  Source:       ${CYAN}$mod_source${NC}"
-            # Get the kernel version this was built for
-            local built_for=$(echo "$mod_source" | grep -oP '(?<=/lib/modules/)[^/]+')
+            echo -e "  Path:         $mod_path"
             if [ -n "$built_for" ] && [ "$built_for" != "$KVERS" ]; then
-                echo -e "  Built for:    ${YELLOW}$built_for${NC} (compatible with $KVERS)"
+                echo -e "  Built for:    ${CYAN}$built_for${NC}"
+                echo -e "  Compatible:   ${GREEN}YES${NC} (with $KVERS)"
             fi
         else
-            echo -e "Installed:      ${GREEN}YES${NC} ($mod_path)"
+            echo -e "Installed:      ${GREEN}YES${NC}"
+            echo -e "  Path:         $mod_path"
         fi
         
-        if is_module_signed "$mod_source"; then
-            echo -e "Inst. Signed:   ${GREEN}YES${NC}"
+        # Use mod_source for signature check (it's the actual file)
+        local check_path="$mod_source"
+        [ -z "$check_path" ] && check_path="$mod_path"
+        if is_module_signed "$check_path"; then
+            echo -e "  Signed:       ${GREEN}YES${NC}"
         else
-            echo -e "Inst. Signed:   ${YELLOW}NO${NC}"
+            echo -e "  Signed:       ${YELLOW}NO${NC}"
         fi
     else
         # Check if module is loaded even though we can't find the file
         if lsmod | grep -q "^rcraid"; then
             echo -e "Installed:      ${YELLOW}UNKNOWN${NC} (module loaded but file not found)"
+            # Try one more time with modinfo directly
+            local modinfo_path=$(modinfo -n rcraid 2>/dev/null)
+            if [ -n "$modinfo_path" ]; then
+                echo -e "  modinfo path: $modinfo_path"
+            fi
         else
             echo -e "Installed:      ${YELLOW}NO${NC}"
         fi
