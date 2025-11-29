@@ -102,6 +102,163 @@ OS_ID=$(get_os_id)
 OS_VERSION_ID=$(get_os_version_id)
 
 #######################################
+# EPEL and CRB Repository Setup
+#######################################
+
+# Check if CRB (CodeReady Builder) repo is enabled
+is_crb_enabled() {
+    # Check for various CRB repo names across distributions
+    if dnf repolist enabled 2>/dev/null | grep -qiE "(crb|codeready|powertools)"; then
+        return 0
+    fi
+    return 1
+}
+
+# Check if EPEL repo is enabled
+is_epel_enabled() {
+    if dnf repolist enabled 2>/dev/null | grep -qi "epel"; then
+        return 0
+    fi
+    return 1
+}
+
+# Enable CRB repository
+enable_crb_repo() {
+    print_status "Enabling CRB (CodeReady Builder) repository..."
+    
+    # Try different methods based on distribution
+    if [ "$OS_ID" = "rhel" ]; then
+        # Official RHEL uses subscription-manager
+        if command -v subscription-manager &> /dev/null; then
+            subscription-manager repos --enable "codeready-builder-for-rhel-${RHEL_MAJOR}-$(arch)-rpms" 2>/dev/null && return 0
+        fi
+    fi
+    
+    # For AlmaLinux, Rocky, CentOS Stream - use dnf config-manager
+    if command -v dnf &> /dev/null; then
+        # Try 'crb' first (EL9+)
+        dnf config-manager --set-enabled crb 2>/dev/null && return 0
+        
+        # Try 'powertools' (EL8)
+        dnf config-manager --set-enabled powertools 2>/dev/null && return 0
+        
+        # Try with full repo name patterns
+        local crb_repo=$(dnf repolist --all 2>/dev/null | grep -iE "crb|codeready|powertools" | awk '{print $1}' | head -1)
+        if [ -n "$crb_repo" ]; then
+            dnf config-manager --set-enabled "$crb_repo" 2>/dev/null && return 0
+        fi
+    fi
+    
+    print_warning "Could not automatically enable CRB repository"
+    echo "You may need to enable it manually:"
+    echo "  sudo dnf config-manager --set-enabled crb"
+    echo "  # or for RHEL:"
+    echo "  sudo subscription-manager repos --enable codeready-builder-for-rhel-${RHEL_MAJOR}-\$(arch)-rpms"
+    return 1
+}
+
+# Install EPEL repository
+install_epel_repo() {
+    print_status "Installing EPEL repository..."
+    
+    # First ensure CRB is enabled (required for many EPEL packages)
+    if ! is_crb_enabled; then
+        enable_crb_repo
+    fi
+    
+    # Determine EPEL URL based on RHEL version
+    local epel_url=""
+    if [ "$RHEL_MAJOR" -ge 10 ]; then
+        epel_url="https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm"
+    else
+        epel_url="https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm"
+    fi
+    
+    print_status "Installing from: $epel_url"
+    
+    if dnf install -y "$epel_url"; then
+        print_status "EPEL repository installed successfully!"
+        return 0
+    else
+        print_error "Failed to install EPEL repository"
+        return 1
+    fi
+}
+
+# Check and offer to install DKMS with EPEL if needed
+check_and_install_dkms() {
+    if command -v dkms &> /dev/null; then
+        print_status "DKMS is already installed"
+        return 0
+    fi
+    
+    print_warning "DKMS is not installed"
+    echo ""
+    echo "DKMS (Dynamic Kernel Module Support) is required for automatic"
+    echo "module rebuilding when you update your kernel."
+    echo ""
+    echo "DKMS is available from the EPEL repository."
+    echo ""
+    
+    # Check current repo status
+    local need_crb=0
+    local need_epel=0
+    
+    if ! is_crb_enabled; then
+        echo "  - CRB repository: NOT ENABLED (required for EPEL)"
+        need_crb=1
+    else
+        echo "  - CRB repository: enabled"
+    fi
+    
+    if ! is_epel_enabled; then
+        echo "  - EPEL repository: NOT INSTALLED"
+        need_epel=1
+    else
+        echo "  - EPEL repository: enabled"
+    fi
+    
+    echo ""
+    
+    if [ $need_crb -eq 1 ] || [ $need_epel -eq 1 ]; then
+        read -p "Install required repositories and DKMS? (Y/n): " install_choice
+        if [ "$install_choice" = "n" ] || [ "$install_choice" = "N" ]; then
+            print_warning "DKMS installation skipped"
+            return 1
+        fi
+        
+        # Enable CRB if needed
+        if [ $need_crb -eq 1 ]; then
+            enable_crb_repo || print_warning "CRB enable failed, continuing anyway..."
+        fi
+        
+        # Install EPEL if needed
+        if [ $need_epel -eq 1 ]; then
+            install_epel_repo || {
+                print_error "EPEL installation failed"
+                return 1
+            }
+        fi
+    else
+        read -p "Install DKMS? (Y/n): " install_choice
+        if [ "$install_choice" = "n" ] || [ "$install_choice" = "N" ]; then
+            print_warning "DKMS installation skipped"
+            return 1
+        fi
+    fi
+    
+    # Now install DKMS
+    print_status "Installing DKMS..."
+    if dnf install -y dkms; then
+        print_status "DKMS installed successfully!"
+        return 0
+    else
+        print_error "Failed to install DKMS"
+        return 1
+    fi
+}
+
+#######################################
 # Helper Functions
 #######################################
 
@@ -180,6 +337,7 @@ check_secure_boot() {
 
 find_installed_module() {
     # Check various locations for installed module
+    # This includes weak-modules symlinks which point to modules built for other kernels
     local locations=(
         "/lib/modules/$KVERS/extra/rcraid.ko"
         "/lib/modules/$KVERS/extra/rcraid/rcraid.ko"
@@ -187,12 +345,23 @@ find_installed_module() {
         "/lib/modules/$KVERS/extra/rcraid/rcraid.ko.xz"
         "/lib/modules/$KVERS/updates/rcraid.ko"
         "/lib/modules/$KVERS/updates/rcraid.ko.xz"
+        "/lib/modules/$KVERS/weak-updates/rcraid.ko"
+        "/lib/modules/$KVERS/weak-updates/rcraid/rcraid.ko"
     )
     
     for loc in "${locations[@]}"; do
-        if [ -f "$loc" ]; then
-            echo "$loc"
-            return 0
+        if [ -f "$loc" ] || [ -L "$loc" ]; then
+            # If it's a symlink, resolve it to show the actual module
+            if [ -L "$loc" ]; then
+                local real_path=$(readlink -f "$loc")
+                if [ -f "$real_path" ]; then
+                    echo "$loc"
+                    return 0
+                fi
+            else
+                echo "$loc"
+                return 0
+            fi
         fi
     done
     
@@ -200,6 +369,61 @@ find_installed_module() {
     local dkms_module=$(find /var/lib/dkms/rcraid -name "rcraid.ko" 2>/dev/null | head -1)
     if [ -n "$dkms_module" ]; then
         echo "$dkms_module"
+        return 0
+    fi
+    
+    return 1
+}
+
+# Find module info including weak-modules status
+find_module_info() {
+    local module_path=""
+    local module_source=""
+    local is_weak_module=0
+    
+    # Check weak-updates first (this is where symlinks from other kernels appear)
+    local weak_locations=(
+        "/lib/modules/$KVERS/weak-updates/rcraid.ko"
+        "/lib/modules/$KVERS/weak-updates/rcraid/rcraid.ko"
+    )
+    
+    for loc in "${weak_locations[@]}"; do
+        if [ -L "$loc" ]; then
+            local real_path=$(readlink -f "$loc")
+            if [ -f "$real_path" ]; then
+                module_path="$loc"
+                module_source="$real_path"
+                is_weak_module=1
+                break
+            fi
+        fi
+    done
+    
+    # If not found in weak-updates, check regular locations
+    if [ -z "$module_path" ]; then
+        local regular_locations=(
+            "/lib/modules/$KVERS/extra/rcraid.ko"
+            "/lib/modules/$KVERS/extra/rcraid/rcraid.ko"
+            "/lib/modules/$KVERS/extra/rcraid.ko.xz"
+            "/lib/modules/$KVERS/extra/rcraid/rcraid.ko.xz"
+            "/lib/modules/$KVERS/updates/rcraid.ko"
+            "/lib/modules/$KVERS/updates/rcraid.ko.xz"
+        )
+        
+        for loc in "${regular_locations[@]}"; do
+            if [ -f "$loc" ]; then
+                module_path="$loc"
+                module_source="$loc"
+                break
+            fi
+        done
+    fi
+    
+    # Output results
+    if [ -n "$module_path" ]; then
+        echo "path:$module_path"
+        echo "source:$module_source"
+        echo "weak:$is_weak_module"
         return 0
     fi
     
@@ -806,11 +1030,11 @@ setup_dkms() {
     
     print_status "Setting up DKMS for automatic rebuilds..."
     
-    # Install DKMS if not present
-    if ! command -v dkms &> /dev/null; then
-        print_status "Installing DKMS..."
-        dnf install -y dkms
-    fi
+    # Check and install DKMS if needed (handles EPEL/CRB setup)
+    check_and_install_dkms || {
+        print_error "DKMS is required for this operation"
+        return 1
+    }
     
     # Check if module is already installed and signed
     local existing_module=$(find_installed_module)
@@ -1854,35 +2078,66 @@ show_system_status() {
         echo -e "Built Module:   ${YELLOW}NOT BUILT${NC}"
     fi
     
-    # Installed module status
-    local installed=$(find_installed_module)
-    if [ -n "$installed" ]; then
-        echo -e "Installed:      ${GREEN}YES${NC} ($installed)"
-        if is_module_signed "$installed"; then
+    # Installed module status with weak-modules detection
+    local module_info=$(find_module_info)
+    if [ -n "$module_info" ]; then
+        local mod_path=$(echo "$module_info" | grep "^path:" | cut -d: -f2)
+        local mod_source=$(echo "$module_info" | grep "^source:" | cut -d: -f2)
+        local is_weak=$(echo "$module_info" | grep "^weak:" | cut -d: -f2)
+        
+        if [ "$is_weak" = "1" ]; then
+            echo -e "Installed:      ${GREEN}YES${NC} (via weak-modules)"
+            echo -e "  Symlink:      $mod_path"
+            echo -e "  Source:       ${CYAN}$mod_source${NC}"
+            # Get the kernel version this was built for
+            local built_for=$(echo "$mod_source" | grep -oP '(?<=/lib/modules/)[^/]+')
+            if [ -n "$built_for" ] && [ "$built_for" != "$KVERS" ]; then
+                echo -e "  Built for:    ${YELLOW}$built_for${NC} (compatible with $KVERS)"
+            fi
+        else
+            echo -e "Installed:      ${GREEN}YES${NC} ($mod_path)"
+        fi
+        
+        if is_module_signed "$mod_source"; then
             echo -e "Inst. Signed:   ${GREEN}YES${NC}"
         else
             echo -e "Inst. Signed:   ${YELLOW}NO${NC}"
         fi
     else
-        echo -e "Installed:      ${YELLOW}NO${NC}"
+        # Check if module is loaded even though we can't find the file
+        if lsmod | grep -q "^rcraid"; then
+            echo -e "Installed:      ${YELLOW}UNKNOWN${NC} (module loaded but file not found)"
+        else
+            echo -e "Installed:      ${YELLOW}NO${NC}"
+        fi
     fi
     
     # Module loaded status
     if lsmod | grep -q "^rcraid"; then
-        echo -e "Module Loaded:  ${GREEN}YES${NC}"
+        local mod_size=$(lsmod | grep "^rcraid" | awk '{print $2}')
+        echo -e "Module Loaded:  ${GREEN}YES${NC} (size: ${mod_size})"
     else
         echo -e "Module Loaded:  ${YELLOW}NO${NC}"
     fi
     
     # DKMS status
     if command -v dkms &> /dev/null; then
-        if dkms status 2>/dev/null | grep -q "$DRIVER_NAME"; then
+        local dkms_status=$(dkms status 2>/dev/null | grep "$DRIVER_NAME")
+        if [ -n "$dkms_status" ]; then
             echo -e "DKMS Status:    ${GREEN}CONFIGURED${NC}"
+            # Show which kernels DKMS has built for
+            local dkms_kernels=$(dkms status 2>/dev/null | grep "$DRIVER_NAME" | grep -oP '\d+\.\d+\.[^,]+' | tr '\n' ' ')
+            if [ -n "$dkms_kernels" ]; then
+                echo -e "  DKMS Kernels: $dkms_kernels"
+            fi
         else
             echo -e "DKMS Status:    ${YELLOW}NOT CONFIGURED${NC}"
         fi
     else
         echo -e "DKMS Status:    ${YELLOW}NOT INSTALLED${NC}"
+        if ! is_epel_enabled; then
+            echo -e "  EPEL Repo:    ${YELLOW}NOT INSTALLED${NC} (required for DKMS)"
+        fi
     fi
     
     # Available kernels for building

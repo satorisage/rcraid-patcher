@@ -136,6 +136,45 @@ sudo ./rcraid_manager.sh
 # Select option 3: "Setup DKMS"
 ```
 
+### EPEL Repository Requirement
+
+DKMS is available from the EPEL (Extra Packages for Enterprise Linux) repository. The script will automatically:
+
+1. Check if CRB (CodeReady Builder) repository is enabled (required for EPEL)
+2. Enable CRB if needed
+3. Install EPEL repository if not present
+4. Install DKMS
+
+For manual installation:
+```bash
+# RHEL 9.x / AlmaLinux 9 / Rocky 9
+sudo dnf config-manager --set-enabled crb
+sudo dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+sudo dnf install dkms
+
+# RHEL 10.x / AlmaLinux 10 / Rocky 10
+sudo dnf config-manager --set-enabled crb
+sudo dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm
+sudo dnf install dkms
+```
+
+### Weak-Modules (Kernel Compatibility)
+
+RHEL uses a "weak-modules" system that allows kernel modules to work across compatible kernel versions. When you build a module for one kernel version, weak-modules automatically creates symlinks in newer kernel directories if the ABI is compatible.
+
+This means:
+- A module built for kernel `6.12.0-124.8.1` may automatically work with `6.12.0-124.13.1`
+- The script detects and displays weak-module symlinks in the status display
+- You don't always need to rebuild after kernel updates!
+
+The status display shows:
+```
+Installed:      YES (via weak-modules)
+  Symlink:      /lib/modules/6.12.0-124.13.1.el10_0.x86_64/weak-updates/rcraid.ko
+  Source:       /lib/modules/6.12.0-124.8.1.el10_0.x86_64/extra/rcraid/rcraid.ko
+  Built for:    6.12.0-124.8.1.el10_0.x86_64 (compatible with current)
+```
+
 ### Preserving Signed Modules
 
 If you have Secure Boot enabled and have already signed and enrolled your module, the DKMS setup will offer to preserve the existing signed module for your current kernel. This prevents the need to re-sign after setting up DKMS.

@@ -345,31 +345,30 @@ echo ""
 print_status "Installation complete!"
 echo ""
 
-# Check for Secure Boot
-check_secure_boot() {
-    if command -v mokutil &> /dev/null; then
-        if mokutil --sb-state 2>/dev/null | grep -q "SecureBoot enabled"; then
-            return 0
-        fi
+# Check if module loaded
+if lsmod | grep -q "^rcraid"; then
+    echo -e "${GREEN}The rcraid module is loaded and ready!${NC}"
+else
+    echo -e "${YELLOW}The rcraid module is not currently loaded.${NC}"
+    
+    # Check for Secure Boot
+    if check_secure_boot; then
+        echo ""
+        echo "Secure Boot is enabled. If the AMD installer prompted you to"
+        echo "set a MOK enrollment password, you'll need to reboot and"
+        echo "complete the enrollment in the MOK Manager (blue screen)."
     fi
-    return 1
-}
-
-if check_secure_boot; then
-    echo -e "${YELLOW}Secure Boot is ENABLED${NC}"
+    
     echo ""
-    echo "The module needs to be signed for Secure Boot. You can:"
-    echo "  1. Run: sudo ./rcraid_manager.sh"
-    echo "     - Use option 11 to generate signing key"
-    echo "     - Use option 8 to sign the installed module"
-    echo "     - Use option 9 to enroll MOK key"
-    echo "     - Reboot and complete MOK enrollment"
-    echo ""
-    echo "  2. Or disable Secure Boot in BIOS/UEFI"
+    echo "You can try loading it manually with:"
+    echo "  sudo modprobe rcraid"
 fi
 
 echo ""
 echo "To verify installation:"
 echo "  lsmod | grep rcraid"
 echo "  dmesg | grep -i rcraid"
+echo ""
+echo "For DKMS setup (auto-rebuild on kernel updates), run:"
+echo "  sudo ./rcraid_manager.sh  # Select option 3"
 echo ""
