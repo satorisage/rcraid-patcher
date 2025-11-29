@@ -812,6 +812,30 @@ setup_dkms() {
         dnf install -y dkms
     fi
     
+    # Check if module is already installed and signed
+    local existing_module=$(find_installed_module)
+    local module_is_signed=0
+    local preserve_module=0
+    
+    if [ -n "$existing_module" ] && [ -f "$existing_module" ]; then
+        if is_module_signed "$existing_module"; then
+            module_is_signed=1
+            print_status "Found existing signed module: $existing_module"
+            echo ""
+            echo "The current module is already signed. DKMS normally rebuilds modules,"
+            echo "which would invalidate the signature and require re-signing."
+            echo ""
+            echo "Options:"
+            echo "  1. Preserve current signed module for this kernel, only rebuild for new kernels"
+            echo "  2. Set up DKMS normally (will need to re-sign after any rebuild)"
+            echo ""
+            read -p "Preserve current signed module? (Y/n): " preserve_choice
+            if [ "$preserve_choice" != "n" ] && [ "$preserve_choice" != "N" ]; then
+                preserve_module=1
+            fi
+        fi
+    fi
+    
     # Remove old DKMS module if exists
     if dkms status | grep -q "$DRIVER_NAME"; then
         print_status "Removing old DKMS module..."
@@ -863,6 +887,12 @@ setup_dkms() {
     # Patch mk_certs in DKMS dir
     patch_mk_certs "$DKMS_DIR"
     
+    # Check if we have signing keys
+    local has_signing_key=0
+    if [ -f "$CERT_DIR/module_signing_key.der" ] && [ -f "$CERT_DIR/module_signing_key.priv" ]; then
+        has_signing_key=1
+    fi
+    
     # Create DKMS configuration
     print_status "Creating DKMS configuration..."
     cat > "$DKMS_DIR/dkms.conf" << DKMSCONF
@@ -874,17 +904,80 @@ AUTOINSTALL="yes"
 MAKE[0]="ln -sf rcblob.x86_64 rcblob.x86_64.o; make -C \${kernel_source_dir} M=\${dkms_tree}/\${PACKAGE_NAME}/\${PACKAGE_VERSION}/build modules"
 DKMSCONF
 
+    # Add POST_BUILD signing hook if we have keys and Secure Boot is enabled
+    if [ $has_signing_key -eq 1 ] && check_secure_boot; then
+        print_status "Adding automatic signing hook to DKMS..."
+        cat >> "$DKMS_DIR/dkms.conf" << DKMSCONF
+# Automatic module signing for Secure Boot
+POST_BUILD="sign_module.sh \${kernelver}"
+DKMSCONF
+        
+        # Create the signing script
+        cat > "$DKMS_DIR/sign_module.sh" << 'SIGNSCRIPT'
+#!/bin/bash
+# DKMS POST_BUILD hook for module signing
+KVER="$1"
+CERT_DIR="/var/lib/rccert/certs"
+SIGN_TOOL="/usr/src/kernels/$KVER/scripts/sign-file"
+
+if [ -f "$SIGN_TOOL" ] && [ -f "$CERT_DIR/module_signing_key.priv" ]; then
+    MODULE_PATH="$(dirname $0)/rcraid.ko"
+    if [ -f "$MODULE_PATH" ]; then
+        "$SIGN_TOOL" sha512 \
+            "$CERT_DIR/module_signing_key.priv" \
+            "$CERT_DIR/module_signing_key.der" \
+            "$MODULE_PATH"
+        echo "Module signed for kernel $KVER"
+    fi
+fi
+SIGNSCRIPT
+        chmod +x "$DKMS_DIR/sign_module.sh"
+    fi
+
     # Add to DKMS
     print_status "Adding module to DKMS..."
     dkms add -m "$DRIVER_NAME" -v "$DRIVER_VERSION"
     
-    # Build
-    print_status "Building module with DKMS..."
-    dkms build -m "$DRIVER_NAME" -v "$DRIVER_VERSION"
-    
-    # Install
-    print_status "Installing module with DKMS..."
-    dkms install -m "$DRIVER_NAME" -v "$DRIVER_VERSION"
+    if [ $preserve_module -eq 1 ]; then
+        # Use the existing signed module instead of rebuilding
+        print_status "Preserving existing signed module for kernel $KVERS..."
+        
+        # Create the DKMS build directory structure
+        local dkms_build_dir="/var/lib/dkms/$DRIVER_NAME/$DRIVER_VERSION/$KVERS/x86_64"
+        mkdir -p "$dkms_build_dir/module"
+        
+        # Copy the existing module (decompress if needed)
+        if [[ "$existing_module" == *.xz ]]; then
+            xz -dk "$existing_module" -c > "$dkms_build_dir/module/rcraid.ko"
+        else
+            cp "$existing_module" "$dkms_build_dir/module/rcraid.ko"
+        fi
+        
+        # Install (will use the preserved module)
+        print_status "Installing preserved module..."
+        dkms install -m "$DRIVER_NAME" -v "$DRIVER_VERSION" -k "$KVERS" --force 2>/dev/null || {
+            # If that fails, manually ensure module is in place
+            print_warning "Standard install failed, ensuring module is in place..."
+            mkdir -p "/lib/modules/$KVERS/extra/$DRIVER_NAME"
+            if [[ "$existing_module" == *.xz ]]; then
+                xz -dk "$existing_module" -c > "/lib/modules/$KVERS/extra/$DRIVER_NAME/rcraid.ko"
+            else
+                cp "$existing_module" "/lib/modules/$KVERS/extra/$DRIVER_NAME/rcraid.ko"
+            fi
+            depmod -a "$KVERS"
+        }
+        
+        print_status "Existing signed module preserved. Future kernel updates will"
+        print_status "trigger rebuilds which will be auto-signed with your MOK key."
+    else
+        # Build normally
+        print_status "Building module with DKMS..."
+        dkms build -m "$DRIVER_NAME" -v "$DRIVER_VERSION"
+        
+        # Install
+        print_status "Installing module with DKMS..."
+        dkms install -m "$DRIVER_NAME" -v "$DRIVER_VERSION"
+    fi
     
     # Configure module to load at boot
     cat > /etc/modules-load.d/rcraid.conf << EOF
@@ -907,22 +1000,33 @@ EOF
     dkms status
     echo ""
     
-    # Check if we need to sign for Secure Boot
+    # Signing guidance
     if check_secure_boot; then
         echo -e "${YELLOW}Secure Boot is enabled!${NC}"
         echo ""
-        echo "DKMS may have its own MOK key. Check with:"
-        echo "  sudo mokutil --list-enrolled"
-        echo ""
-        echo "If the module fails to load, you may need to:"
-        echo "  1. Sign the module manually (use menu option 8)"
-        echo "  2. Enroll your signing key (use menu option 9)"
-        echo ""
-        read -p "Sign and enroll key now? (Y/n): " sign_now
-        if [ "$sign_now" != "n" ] && [ "$sign_now" != "N" ]; then
-            generate_signing_key
-            sign_installed_module
-            enroll_mok_key
+        if [ $has_signing_key -eq 1 ]; then
+            echo "Automatic signing is configured. New kernel builds will be signed"
+            echo "automatically using your existing MOK key."
+            if [ $preserve_module -eq 0 ]; then
+                echo ""
+                echo "The module was just rebuilt and needs to be signed."
+                read -p "Sign the module now? (Y/n): " sign_now
+                if [ "$sign_now" != "n" ] && [ "$sign_now" != "N" ]; then
+                    sign_installed_module
+                fi
+            fi
+        else
+            echo "No signing key found. For Secure Boot systems, you need to:"
+            echo "  1. Generate a signing key (menu option 11)"
+            echo "  2. Sign the module (menu option 8)"
+            echo "  3. Enroll the key in MOK (menu option 9)"
+            echo ""
+            read -p "Set up module signing now? (Y/n): " setup_signing
+            if [ "$setup_signing" != "n" ] && [ "$setup_signing" != "N" ]; then
+                generate_signing_key
+                sign_installed_module
+                enroll_mok_key
+            fi
         fi
     fi
     
@@ -1369,6 +1473,149 @@ build_driver_iso() {
 # This file exists to prevent "can't find ks.cfg" warnings during inst.dd
 # It contains no actual kickstart configuration
 KSCFG
+
+    # Create post-install helper script for Secure Boot setup
+    cat > $DUD_DIR/rcraid_post_install.sh << 'POSTINSTALL'
+#!/bin/bash
+#
+# AMD rcraid Post-Installation Helper
+# Run this after fresh install to set up DKMS and Secure Boot signing
+#
+
+set -e
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+print_status() { echo -e "${GREEN}[INFO]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+echo -e "${BLUE}=============================================${NC}"
+echo -e "${BLUE}  AMD rcraid Post-Installation Setup${NC}"
+echo -e "${BLUE}=============================================${NC}"
+echo ""
+
+# Check for root
+if [ "$(id -u)" -ne 0 ]; then
+    print_error "This script must be run as root"
+    echo "Usage: sudo $0"
+    exit 1
+fi
+
+KVERS=$(uname -r)
+
+# Check if Secure Boot is enabled
+check_secure_boot() {
+    if command -v mokutil &> /dev/null; then
+        if mokutil --sb-state 2>/dev/null | grep -q "SecureBoot enabled"; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Check if module is loaded
+if ! lsmod | grep -q "^rcraid"; then
+    print_warning "rcraid module is not currently loaded"
+    print_warning "If Secure Boot is enabled, you may need to disable it temporarily"
+    print_warning "or enroll the module signing key before the driver will load."
+fi
+
+# Secure Boot handling
+if check_secure_boot; then
+    print_warning "Secure Boot is ENABLED"
+    echo ""
+    echo "The driver module from the installation ISO is not signed with your"
+    echo "system's MOK (Machine Owner Key). You have several options:"
+    echo ""
+    echo "  1. Generate a signing key, sign the module, and enroll in MOK"
+    echo "  2. Temporarily disable Secure Boot in BIOS/UEFI"
+    echo "  3. Use the full rcraid_manager.sh tool for complete setup"
+    echo ""
+    read -p "Would you like to set up module signing now? (Y/n): " setup_signing
+    
+    if [ "$setup_signing" != "n" ] && [ "$setup_signing" != "N" ]; then
+        # Generate signing key
+        CERT_DIR="/var/lib/rccert/certs"
+        mkdir -p "$CERT_DIR"
+        chmod 700 "$CERT_DIR"
+        
+        if [ ! -f "$CERT_DIR/module_signing_key.der" ]; then
+            print_status "Generating module signing key..."
+            openssl req -new -x509 -newkey rsa:4096 \
+                -keyout "$CERT_DIR/module_signing_key.priv" \
+                -outform DER \
+                -out "$CERT_DIR/module_signing_key.der" \
+                -nodes -days 3650 \
+                -subj "/CN=rcraid module signing key $(hostname)/"
+            chmod 600 "$CERT_DIR/module_signing_key.priv"
+        fi
+        
+        # Find and sign the module
+        MODULE_PATH="/lib/modules/$KVERS/extra/rcraid/rcraid.ko"
+        if [ ! -f "$MODULE_PATH" ]; then
+            MODULE_PATH=$(find /lib/modules/$KVERS -name "rcraid.ko*" | head -1)
+        fi
+        
+        if [ -n "$MODULE_PATH" ] && [ -f "$MODULE_PATH" ]; then
+            # Handle compressed module
+            if [[ "$MODULE_PATH" == *.xz ]]; then
+                print_status "Decompressing module..."
+                xz -d "$MODULE_PATH"
+                MODULE_PATH="${MODULE_PATH%.xz}"
+            fi
+            
+            # Sign the module
+            SIGN_TOOL="/usr/src/kernels/$KVERS/scripts/sign-file"
+            if [ -f "$SIGN_TOOL" ]; then
+                print_status "Signing module..."
+                "$SIGN_TOOL" sha512 \
+                    "$CERT_DIR/module_signing_key.priv" \
+                    "$CERT_DIR/module_signing_key.der" \
+                    "$MODULE_PATH"
+                print_status "Module signed successfully!"
+            else
+                print_error "sign-file tool not found. Install kernel-devel:"
+                echo "  sudo dnf install kernel-devel-$KVERS"
+            fi
+        fi
+        
+        # Enroll MOK key
+        print_status "Enrolling MOK key..."
+        echo ""
+        echo "You will be prompted to create a password."
+        echo "Remember this password - you'll need it during the next reboot!"
+        echo ""
+        mokutil --import "$CERT_DIR/module_signing_key.der"
+        
+        echo ""
+        print_status "MOK enrollment initiated!"
+        echo ""
+        echo -e "${YELLOW}IMPORTANT: You must reboot to complete enrollment!${NC}"
+        echo ""
+        echo "During reboot, the MOK Manager (blue screen) will appear."
+        echo "  1. Select 'Enroll MOK'"
+        echo "  2. Select 'Continue'"
+        echo "  3. Select 'Yes'"
+        echo "  4. Enter the password you just created"
+        echo "  5. Select 'Reboot'"
+    fi
+else
+    print_status "Secure Boot is DISABLED - no signing required"
+fi
+
+echo ""
+print_status "Post-installation setup complete!"
+echo ""
+echo "For DKMS setup (auto-rebuild on kernel updates), use the full"
+echo "rcraid_manager.sh tool from the rcraid-patcher repository."
+echo ""
+POSTINSTALL
+    chmod +x $DUD_DIR/rcraid_post_install.sh
     
     # Create repo metadata
     cd $DUD_DIR/rpms/x86_64
@@ -1448,6 +1695,12 @@ KSCFG
         echo ""
         echo -e "${GREEN}Method 5: Install on existing system${NC}"
         echo "  sudo rpm -ivh $HOME/$(basename $RPM_FILE)"
+        echo ""
+        echo -e "${CYAN}=== SECURE BOOT NOTE ===${NC}"
+        echo ""
+        echo "The ISO includes 'rcraid_post_install.sh' to help with Secure Boot"
+        echo "setup after a fresh installation. Mount the ISO and run:"
+        echo "  sudo /path/to/mount/rcraid_post_install.sh"
         echo ""
         echo -e "${CYAN}Note: The ISO includes a stub ks.cfg file to prevent${NC}"
         echo -e "${CYAN}'can't find ks.cfg' warnings during installation.${NC}"

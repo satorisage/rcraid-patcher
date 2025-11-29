@@ -53,9 +53,9 @@ sudo dnf install kernel-devel-$(uname -r) gcc make elfutils-libelf-devel openssl
 ./check_setup.sh
 ```
 
-### Option 1: Simple Patch and Install (Recommended for RHEL 9.x)
+### Option 1: Simple Patch and Install
 
-This patches the AMD SDK files and runs the original AMD installer:
+This patches the AMD SDK files and runs the original AMD installer. The script automatically detects whether you're running RHEL 9.x or 10.x and applies the appropriate patches:
 
 ```bash
 sudo ./patch_and_install.sh
@@ -63,7 +63,7 @@ sudo ./patch_and_install.sh
 
 ### Option 2: Full Management Tool (Recommended)
 
-For more control and RHEL 10.x support, use the interactive manager:
+For more control, Secure Boot handling, DKMS setup, and RPM/ISO building:
 
 ```bash
 sudo ./rcraid_manager.sh
@@ -136,12 +136,21 @@ sudo ./rcraid_manager.sh
 # Select option 3: "Setup DKMS"
 ```
 
-Or manually:
+### Preserving Signed Modules
 
-```bash
-sudo ./patch_and_install.sh  # First install
-# DKMS will be configured automatically on supported systems
-```
+If you have Secure Boot enabled and have already signed and enrolled your module, the DKMS setup will offer to preserve the existing signed module for your current kernel. This prevents the need to re-sign after setting up DKMS.
+
+Future kernel updates will trigger rebuilds. If you have a signing key configured, DKMS will automatically sign new builds using a POST_BUILD hook.
+
+### Fresh Install Workflow
+
+After installing RHEL using a Driver Update Disk:
+
+1. The driver is loaded but not signed with your MOK key
+2. Run `rcraid_post_install.sh` from the ISO (or use `rcraid_manager.sh`)
+3. Generate a signing key, sign the module, and enroll in MOK
+4. Reboot and complete MOK enrollment
+5. Set up DKMS to preserve the signed module and enable auto-rebuild
 
 ## Building an RPM Package
 
