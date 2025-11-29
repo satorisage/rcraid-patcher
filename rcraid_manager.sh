@@ -1,7 +1,9 @@
 #!/bin/bash
 #
-# AMD rcraid Driver Manager for RHEL/Alma 9.6+
+# AMD rcraid Driver Manager for RHEL 9.x and 10.x
 # Handles patching, building, signing, DKMS setup, and MOK enrollment
+# Dynamically detects OS version and applies appropriate patches
+# Compatible with RHEL and derivatives (AlmaLinux, Rocky Linux, etc.)
 #
 
 set -e
@@ -15,14 +17,89 @@ DRIVER_SDK_DIR="$SCRIPT_DIR/driver_sdk"
 SRC_DIR="$DRIVER_SDK_DIR/src"
 CERT_DIR="$DRIVER_SDK_DIR/certs"
 DKMS_DIR="/usr/src/${DRIVER_NAME}-${DRIVER_VERSION}"
-SIGN_TOOL="/usr/src/kernels/$KVERS/scripts/sign-file"
+
+# Detect kernel source directory (RHEL vs Ubuntu style)
+if [ -d "/usr/src/kernels/$KVERS" ]; then
+    KERNEL_SRC_DIR="/usr/src/kernels/$KVERS"
+    SIGN_TOOL="/usr/src/kernels/$KVERS/scripts/sign-file"
+elif [ -d "/usr/src/linux-headers-$KVERS" ]; then
+    KERNEL_SRC_DIR="/usr/src/linux-headers-$KVERS"
+    SIGN_TOOL="/usr/src/linux-headers-$KVERS/scripts/sign-file"
+else
+    KERNEL_SRC_DIR=""
+    SIGN_TOOL=""
+fi
 
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
+
+#######################################
+# OS/Kernel Version Detection
+#######################################
+
+# Detect RHEL major version (9 or 10)
+detect_rhel_version() {
+    local rhel_major=0
+    
+    if [ -f /etc/redhat-release ]; then
+        rhel_major=$(grep -oP '(?<=release )\d+' /etc/redhat-release 2>/dev/null | head -1)
+    elif [ -f /etc/os-release ]; then
+        rhel_major=$(grep -oP '(?<=VERSION_ID=")\d+' /etc/os-release 2>/dev/null | head -1)
+    fi
+    
+    # Default to 9 if detection fails
+    if [ -z "$rhel_major" ] || [ "$rhel_major" -lt 9 ]; then
+        rhel_major=9
+    fi
+    
+    echo "$rhel_major"
+}
+
+# Detect kernel major.minor version
+detect_kernel_version() {
+    echo "$KVERS" | grep -oP '^\d+\.\d+' | head -1
+}
+
+# Get full OS name for display
+get_os_name() {
+    if [ -f /etc/redhat-release ]; then
+        cat /etc/redhat-release
+    elif [ -f /etc/os-release ]; then
+        grep PRETTY_NAME /etc/os-release | cut -d'"' -f2
+    else
+        echo "Unknown"
+    fi
+}
+
+# Get OS ID (rhel, almalinux, rocky, etc.)
+get_os_id() {
+    if [ -f /etc/os-release ]; then
+        grep "^ID=" /etc/os-release | cut -d'"' -f2 | cut -d'=' -f2 | tr -d '"'
+    else
+        echo "unknown"
+    fi
+}
+
+# Get OS version ID (e.g., 9.7, 10.1)
+get_os_version_id() {
+    if [ -f /etc/os-release ]; then
+        grep "^VERSION_ID=" /etc/os-release | cut -d'"' -f2 | tr -d '"'
+    else
+        echo "unknown"
+    fi
+}
+
+# Store detected versions globally
+RHEL_MAJOR=$(detect_rhel_version)
+KERNEL_VERSION=$(detect_kernel_version)
+OS_NAME=$(get_os_name)
+OS_ID=$(get_os_id)
+OS_VERSION_ID=$(get_os_version_id)
 
 #######################################
 # Helper Functions
@@ -32,7 +109,7 @@ print_header() {
     clear
     echo -e "${BLUE}=============================================${NC}"
     echo -e "${BLUE}  AMD rcraid Driver Manager${NC}"
-    echo -e "${BLUE}  RHEL/Alma 9.6+ Compatibility Tool${NC}"
+    echo -e "${BLUE}  RHEL 9.x & 10.x Compatibility Tool${NC}"
     echo -e "${BLUE}=============================================${NC}"
     echo ""
 }
@@ -69,7 +146,7 @@ check_driver_sdk() {
 }
 
 check_kernel_devel() {
-    if [ ! -d "/usr/src/kernels/$KVERS" ]; then
+    if [ -z "$KERNEL_SRC_DIR" ] || [ ! -d "$KERNEL_SRC_DIR" ]; then
         print_warning "kernel-devel not installed for $KVERS"
         echo ""
         read -p "Install kernel-devel now? (Y/n): " install_kdev
@@ -79,6 +156,11 @@ check_kernel_devel() {
                 print_error "Failed to install kernel-devel"
                 return 1
             }
+            # Re-detect after install
+            if [ -d "/usr/src/kernels/$KVERS" ]; then
+                KERNEL_SRC_DIR="/usr/src/kernels/$KVERS"
+                SIGN_TOOL="/usr/src/kernels/$KVERS/scripts/sign-file"
+            fi
         else
             print_error "kernel-devel is required to build the module"
             return 1
@@ -103,6 +185,8 @@ find_installed_module() {
         "/lib/modules/$KVERS/extra/rcraid/rcraid.ko"
         "/lib/modules/$KVERS/extra/rcraid.ko.xz"
         "/lib/modules/$KVERS/extra/rcraid/rcraid.ko.xz"
+        "/lib/modules/$KVERS/updates/rcraid.ko"
+        "/lib/modules/$KVERS/updates/rcraid.ko.xz"
     )
     
     for loc in "${locations[@]}"; do
@@ -174,8 +258,15 @@ is_module_signed() {
 }
 
 is_patches_applied() {
+    # Check for EL9 patches
     if [ -f "$SRC_DIR/rc_config.c" ]; then
         if grep -q "RHEL_RELEASE_VERSION(9,6)" "$SRC_DIR/rc_config.c"; then
+            return 0
+        fi
+    fi
+    # Check for EL10 patches
+    if [ -f "$SRC_DIR/rc_init.c" ]; then
+        if grep -q "sdev_configure" "$SRC_DIR/rc_init.c" 2>/dev/null; then
             return 0
         fi
     fi
@@ -191,126 +282,24 @@ is_mk_certs_patched() {
     return 1
 }
 
-show_system_status() {
-    echo ""
-    echo -e "${BLUE}=== System Status ===${NC}"
-    echo ""
-    echo "Kernel Version: $KVERS"
-    
-    # Secure Boot status
-    if check_secure_boot; then
-        echo -e "Secure Boot:    ${YELLOW}ENABLED${NC} (module signing required)"
-    else
-        echo -e "Secure Boot:    ${GREEN}DISABLED${NC}"
-    fi
-    
-    # kernel-devel status
-    if [ -d "/usr/src/kernels/$KVERS" ]; then
-        echo -e "Kernel Devel:   ${GREEN}INSTALLED${NC}"
-    else
-        echo -e "Kernel Devel:   ${RED}NOT INSTALLED${NC}"
-    fi
-    
-    # Driver SDK status
-    if [ -d "$DRIVER_SDK_DIR" ]; then
-        echo -e "Driver SDK:     ${GREEN}FOUND${NC}"
-        if is_patches_applied; then
-            echo -e "Source Patches: ${GREEN}APPLIED${NC}"
-        else
-            echo -e "Source Patches: ${YELLOW}NOT APPLIED${NC}"
-        fi
-        if is_mk_certs_patched; then
-            echo -e "mk_certs Patch: ${GREEN}APPLIED${NC}"
-        else
-            echo -e "mk_certs Patch: ${YELLOW}NOT APPLIED${NC}"
-        fi
-    else
-        echo -e "Driver SDK:     ${RED}NOT FOUND${NC}"
-    fi
-    
-    # Built module status
-    if [ -f "$SRC_DIR/rcraid.ko" ]; then
-        echo -e "Built Module:   ${GREEN}FOUND${NC} ($SRC_DIR/rcraid.ko)"
-        if is_module_signed "$SRC_DIR/rcraid.ko"; then
-            echo -e "Module Signed:  ${GREEN}YES${NC}"
-        else
-            echo -e "Module Signed:  ${YELLOW}NO${NC}"
-        fi
-    else
-        echo -e "Built Module:   ${YELLOW}NOT BUILT${NC}"
-    fi
-    
-    # Installed module status
-    local installed=$(find_installed_module)
-    if [ -n "$installed" ]; then
-        echo -e "Installed:      ${GREEN}YES${NC} ($installed)"
-        if is_module_signed "$installed"; then
-            echo -e "Install Signed: ${GREEN}YES${NC}"
-        else
-            echo -e "Install Signed: ${YELLOW}NO${NC}"
-        fi
-    else
-        echo -e "Installed:      ${YELLOW}NO${NC}"
-    fi
-    
-    # DKMS status
-    if command -v dkms &> /dev/null && dkms status 2>/dev/null | grep -q "$DRIVER_NAME"; then
-        echo -e "DKMS:           ${GREEN}CONFIGURED${NC}"
-        dkms status | grep "$DRIVER_NAME" | sed 's/^/                /'
-    else
-        echo -e "DKMS:           ${YELLOW}NOT CONFIGURED${NC}"
-    fi
-    
-    # Module loaded status
-    if lsmod | grep -q "^rcraid"; then
-        echo -e "Module Loaded:  ${GREEN}YES${NC}"
-    else
-        echo -e "Module Loaded:  ${YELLOW}NO${NC}"
-    fi
-    
-    # Signing key status
-    if [ -f "$CERT_DIR/module_signing_key.der" ]; then
-        echo -e "Signing Key:    ${GREEN}EXISTS${NC}"
-    else
-        echo -e "Signing Key:    ${YELLOW}NOT CREATED${NC}"
-    fi
-    
-    # MOK enrollment status
-    if command -v mokutil &> /dev/null; then
-        local enrolled_keys=$(mokutil --list-enrolled 2>/dev/null | grep -c "Subject:" || echo "0")
-        echo "MOK Keys:       $enrolled_keys key(s) enrolled"
-    fi
-    
-    echo ""
-}
-
 #######################################
-# Main Operations
+# Patching Functions
 #######################################
 
 patch_mk_certs() {
-    local target_dir="$1"
-    
-    if [ -z "$target_dir" ]; then
-        target_dir="$DRIVER_SDK_DIR"
-    fi
-    
-    local mk_certs_file="$target_dir/mk_certs"
+    local mk_certs_file="$1/mk_certs"
     
     if [ ! -f "$mk_certs_file" ]; then
-        print_warning "mk_certs not found at $mk_certs_file, skipping..."
-        return 0
+        print_warning "mk_certs not found at $mk_certs_file"
+        return 1
     fi
     
-    if grep -q "PATCHED_FOR_RHEL" "$mk_certs_file" 2>/dev/null; then
+    if grep -q "PATCHED_FOR_RHEL" "$mk_certs_file"; then
         print_warning "mk_certs already patched, skipping..."
         return 0
     fi
     
-    print_status "Patching mk_certs (DER typo and RHEL paths)..."
-    
-    # Backup original
-    cp -n "$mk_certs_file" "$mk_certs_file.orig" 2>/dev/null || true
+    print_status "Patching mk_certs..."
     
     # Fix the -outform DEV typo -> DER
     if grep -q "\-outform DEV" "$mk_certs_file"; then
@@ -319,31 +308,22 @@ patch_mk_certs() {
     fi
     
     # Add RHEL kernel path for sign-file tool
-    # We need to add the RHEL path before the Ubuntu path checks
     if ! grep -q "/usr/src/kernels/" "$mk_certs_file"; then
         sed -i 's|if \[ -f "/usr/src/linux-headers-\$KVERS/scripts/sign-file" \]; then|if [ -f "/usr/src/kernels/$KVERS/scripts/sign-file" ]; then\n\t\tSIGN_TOOL=/usr/src/kernels/$KVERS/scripts/sign-file\n\t    elif [ -f "/usr/src/linux-headers-$KVERS/scripts/sign-file" ]; then|g' "$mk_certs_file"
         echo "  Added RHEL kernel paths for sign-file tool"
     fi
     
     # Add a marker so we know it's been patched
-    sed -i '1a# PATCHED_FOR_RHEL - AMD rcraid patcher applied RHEL 9.6+ fixes' "$mk_certs_file"
+    sed -i '1a# PATCHED_FOR_RHEL - AMD rcraid patcher applied RHEL 9.x/10.x fixes' "$mk_certs_file"
     
     print_status "mk_certs patched successfully"
     return 0
 }
 
-apply_patches() {
-    print_status "Applying patches for RHEL/Alma 9.6+ compatibility..."
+apply_patches_el9() {
+    print_status "Applying patches for RHEL 9.x (kernel 5.14.x)..."
     
-    check_driver_sdk || return 1
-    
-    # Backup original files
-    print_status "Creating backups of original files..."
-    cp -n "$SRC_DIR/rc_config.c" "$SRC_DIR/rc_config.c.orig" 2>/dev/null || true
-    cp -n "$SRC_DIR/rc_init.c" "$SRC_DIR/rc_init.c.orig" 2>/dev/null || true
-    cp -n "$DRIVER_SDK_DIR/mk_certs" "$DRIVER_SDK_DIR/mk_certs.orig" 2>/dev/null || true
-    
-    # Patch rc_config.c
+    # Patch rc_config.c - genhd.h fix
     if grep -q "RHEL_RELEASE_VERSION(9,6)" "$SRC_DIR/rc_config.c"; then
         print_warning "rc_config.c already patched, skipping..."
     else
@@ -388,9 +368,9 @@ PATCH
         print_status "rc_config.c patched successfully"
     fi
     
-    # Patch rc_init.c
+    # Patch rc_init.c - blk_queue functions fix
     if grep -q "RHEL_RELEASE_VERSION(9,6)" "$SRC_DIR/rc_init.c"; then
-        print_warning "rc_init.c already patched, skipping..."
+        print_warning "rc_init.c already patched for EL9, skipping..."
     else
         print_status "Patching rc_init.c (blk_queue functions fix)..."
         
@@ -421,8 +401,100 @@ PATCH
         cd - > /dev/null
         print_status "rc_init.c patched successfully"
     fi
+}
+
+apply_patches_el10() {
+    print_status "Applying patches for RHEL 10.x (kernel 6.12.x)..."
     
-    # Patch mk_certs
+    cd "$SRC_DIR"
+    
+    # 1. Add vmalloc.h include (required for vmalloc in kernel 6.12+)
+    if ! grep -q '#include <linux/vmalloc.h>' rc_init.c; then
+        sed -i '/#include <linux\/sysctl.h>/a #include <linux/vmalloc.h>' rc_init.c
+        echo "  Added vmalloc.h include"
+    else
+        echo "  vmalloc.h include already present"
+    fi
+    
+    # 2. Fix sdev_configure rename (was slave_configure in older kernels)
+    # 2a. Update forward declaration
+    if grep -q '^static int  rc_slave_cfg(struct scsi_device \*sdev);' rc_init.c; then
+        sed -i 's/^static int  rc_slave_cfg(struct scsi_device \*sdev);/static int rc_slave_cfg(struct scsi_device *sdev, struct queue_limits *lim);/' rc_init.c
+        echo "  Updated rc_slave_cfg forward declaration"
+    fi
+    
+    # 2b. Update function definition (multi-line format)
+    if grep -q '^rc_slave_cfg(struct scsi_device \*sdev)$' rc_init.c; then
+        sed -i 's/^rc_slave_cfg(struct scsi_device \*sdev)$/rc_slave_cfg(struct scsi_device *sdev, struct queue_limits *lim)/' rc_init.c
+        echo "  Updated rc_slave_cfg function definition"
+    fi
+    
+    # 2c. Update struct member from .slave_configure to .sdev_configure
+    if grep -q '\.slave_configure' rc_init.c; then
+        sed -i 's/\.slave_configure/.sdev_configure/' rc_init.c
+        echo "  Updated .slave_configure to .sdev_configure"
+    else
+        echo "  .sdev_configure already updated"
+    fi
+    
+    # 3. Fix blk_queue_* calls - now use queue_limits struct (lim parameter)
+    # Replace blk_queue_max_hw_sectors(sdev->request_queue, 256);
+    # With    lim->max_hw_sectors = 256;
+    if grep -q 'blk_queue_max_hw_sectors' rc_init.c; then
+        sed -i 's/blk_queue_max_hw_sectors(sdev->request_queue, \([^)]*\));/lim->max_hw_sectors = \1;/' rc_init.c
+        echo "  Fixed blk_queue_max_hw_sectors -> lim->max_hw_sectors"
+    fi
+    
+    # Handle the RHEL version conditional we may have added for EL9
+    # Replace the whole conditional block with simple lim assignment
+    if grep -q '#if defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9,6)' rc_init.c; then
+        # Remove the EL9 conditional and replace with EL10 style
+        sed -i '/#if defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9,6)/,/#endif/c\
+        lim->max_hw_sectors = 256;' rc_init.c
+        echo "  Converted EL9 conditional to EL10 queue_limits style"
+    fi
+    
+    # Remove blk_queue_virt_boundary entirely or convert to lim->virt_boundary_mask
+    if grep -q 'blk_queue_virt_boundary' rc_init.c; then
+        sed -i '/blk_queue_virt_boundary/d' rc_init.c
+        echo "  Removed blk_queue_virt_boundary (handled differently in 6.12+)"
+    fi
+    
+    # 4. Fix sysctl registration for kernel 6.12+
+    # Use register_sysctl_sz instead of register_sysctl
+    if grep -q 'rcraid_sysctl_hdr = register_sysctl("rcraid", rcraid_table);' rc_init.c; then
+        sed -i 's/rcraid_sysctl_hdr = register_sysctl("rcraid", rcraid_table);/rcraid_sysctl_hdr = register_sysctl_sz("rcraid", rcraid_table, ARRAY_SIZE(rcraid_table) - 1);/' rc_init.c
+        echo "  Fixed sysctl registration for kernel 6.12+"
+    else
+        echo "  sysctl registration already fixed or not present"
+    fi
+    
+    cd - > /dev/null
+    print_status "EL10 patches applied successfully"
+}
+
+apply_patches() {
+    print_status "Applying patches for $(get_os_name) compatibility..."
+    print_status "Detected: RHEL major=$RHEL_MAJOR, Kernel=$KERNEL_VERSION"
+    
+    check_driver_sdk || return 1
+    
+    # Backup original files
+    print_status "Creating backups of original files..."
+    cp -n "$SRC_DIR/rc_config.c" "$SRC_DIR/rc_config.c.orig" 2>/dev/null || true
+    cp -n "$SRC_DIR/rc_init.c" "$SRC_DIR/rc_init.c.orig" 2>/dev/null || true
+    cp -n "$DRIVER_SDK_DIR/mk_certs" "$DRIVER_SDK_DIR/mk_certs.orig" 2>/dev/null || true
+    
+    # Apply version-specific patches
+    if [ "$RHEL_MAJOR" -ge 10 ]; then
+        # RHEL 10.x / kernel 6.x
+        apply_patches_el10
+    else
+        # RHEL 9.x / kernel 5.14.x
+        apply_patches_el9
+    fi
+    
+    # Patch mk_certs (common to all versions)
     patch_mk_certs "$DRIVER_SDK_DIR"
     
     # Create symlink for binary blob if needed
@@ -437,6 +509,10 @@ PATCH
     print_status "All patches applied successfully!"
     return 0
 }
+
+#######################################
+# Build Functions
+#######################################
 
 build_module() {
     print_status "Building rcraid module..."
@@ -469,6 +545,10 @@ build_module() {
         return 1
     fi
 }
+
+#######################################
+# Signing Functions
+#######################################
 
 generate_signing_key() {
     print_status "Generating module signing key..."
@@ -536,51 +616,77 @@ sign_module() {
     # Check for sign-file tool
     if [ ! -f "$SIGN_TOOL" ]; then
         print_error "sign-file tool not found at $SIGN_TOOL"
-        echo "Please install kernel-devel: sudo dnf install kernel-devel-$KVERS"
+        echo "Please ensure kernel-devel is installed."
         return 1
     fi
     
     # Sign the module
-    "$SIGN_TOOL" sha256 \
+    "$SIGN_TOOL" sha512 \
         "$CERT_DIR/module_signing_key.priv" \
         "$CERT_DIR/module_signing_key.der" \
         "$module_path"
     
-    # Verify
-    if is_module_signed "$module_path"; then
-        print_status "Module signed successfully!"
-        return 0
-    else
-        print_error "Module signing may have failed!"
+    print_status "Module signed successfully!"
+    return 0
+}
+
+sign_installed_module() {
+    check_root || return 1
+    
+    local module_path=$(find_installed_module)
+    
+    if [ -z "$module_path" ]; then
+        print_error "No installed module found!"
         return 1
     fi
+    
+    print_status "Found installed module: $module_path"
+    
+    # Handle compressed modules
+    local was_compressed=0
+    if [[ "$module_path" == *.xz ]]; then
+        was_compressed=1
+        print_status "Decompressing module..."
+        xz -d "$module_path"
+        module_path="${module_path%.xz}"
+    fi
+    
+    # Sign it
+    sign_module "$module_path" || return 1
+    
+    # Re-compress if it was compressed
+    if [ $was_compressed -eq 1 ]; then
+        print_status "Re-compressing module..."
+        xz "$module_path"
+    fi
+    
+    print_status "Installed module signed successfully!"
+    return 0
 }
 
 enroll_mok_key() {
     check_root || return 1
     
     if [ ! -f "$CERT_DIR/module_signing_key.der" ]; then
-        print_error "No signing key found!"
-        echo "Please generate a signing key first (option to sign module will do this)."
+        print_error "Signing key not found!"
+        echo "Please generate a signing key first (menu option 11)."
         return 1
     fi
     
     print_status "Enrolling MOK key..."
     echo ""
-    echo -e "${YELLOW}IMPORTANT:${NC}"
     echo "You will be prompted to create a password."
-    echo "REMEMBER THIS PASSWORD - you need it on next reboot!"
+    echo "Remember this password - you'll need it during the next reboot!"
     echo ""
     
-    mokutil --import "$CERT_DIR/module_signing_key.der"
-    
-    if [ $? -eq 0 ]; then
+    if mokutil --import "$CERT_DIR/module_signing_key.der"; then
         echo ""
-        print_status "MOK key queued for enrollment!"
+        print_status "Key enrollment initiated!"
         echo ""
-        echo -e "${YELLOW}=== REBOOT REQUIRED ===${NC}"
+        echo -e "${YELLOW}IMPORTANT: You must reboot to complete enrollment!${NC}"
         echo ""
-        echo "On reboot, the MOK Manager (blue screen) will appear:"
+        echo "During reboot, the MOK Manager (blue screen) will appear."
+        echo "Follow these steps:"
         echo "  1. Select 'Enroll MOK'"
         echo "  2. Select 'Continue'"
         echo "  3. Select 'Yes'"
@@ -593,6 +699,10 @@ enroll_mok_key() {
         return 1
     fi
 }
+
+#######################################
+# Installation Functions
+#######################################
 
 install_module() {
     check_root || return 1
@@ -641,6 +751,7 @@ full_install() {
     
     echo ""
     print_status "Starting full installation process..."
+    print_status "Target: $(get_os_name) / Kernel $KVERS"
     echo ""
     
     # Step 1: Apply patches
@@ -683,6 +794,10 @@ full_install() {
     
     return 0
 }
+
+#######################################
+# DKMS Functions
+#######################################
 
 setup_dkms() {
     check_root || return 1
@@ -733,68 +848,17 @@ setup_dkms() {
     # Apply patches to DKMS source
     print_status "Applying patches to DKMS source..."
     
-    # Patch rc_config.c in DKMS dir
-    if ! grep -q "RHEL_RELEASE_VERSION(9,6)" "$DKMS_DIR/rc_config.c"; then
-        cat > /tmp/rc_config_fix.patch << 'PATCH'
---- a/rc_config.c
-+++ b/rc_config.c
-@@ -8,13 +8,12 @@
- #include <linux/fs.h>
- #include <linux/miscdevice.h>
- #include <linux/version.h>
--#if LINUX_VERSION_CODE < KERNEL_VERSION(5,14,0)
--#ifndef RHEL_RCBUILD
-+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,14,0) && !defined(RHEL_RELEASE_CODE)
- #include <linux/genhd.h>
--#endif
--#else
--//#include <blkdev.h>
-+#elif defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE < RHEL_RELEASE_VERSION(9,6)
-+#include <linux/genhd.h>
- #endif
-+#include <linux/blkdev.h>
- #include <linux/sched.h>
- #include <linux/completion.h>
- #include <linux/vmalloc.h>
-PATCH
-        cd "$DKMS_DIR"
-        patch -p1 --forward < /tmp/rc_config_fix.patch 2>/dev/null || {
-            sed -i '11,17d' rc_config.c
-            sed -i '10a\
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,14,0) \&\& !defined(RHEL_RELEASE_CODE)\
-#include <linux/genhd.h>\
-#elif defined(RHEL_RELEASE_CODE) \&\& RHEL_RELEASE_CODE < RHEL_RELEASE_VERSION(9,6)\
-#include <linux/genhd.h>\
-#endif\
-#include <linux/blkdev.h>' rc_config.c
-        }
-        cd - > /dev/null
-        echo "  Patched rc_config.c"
+    # Temporarily set SRC_DIR to DKMS_DIR for patching
+    local orig_src_dir="$SRC_DIR"
+    SRC_DIR="$DKMS_DIR"
+    
+    if [ "$RHEL_MAJOR" -ge 10 ]; then
+        apply_patches_el10
+    else
+        apply_patches_el9
     fi
     
-    # Patch rc_init.c in DKMS dir
-    if ! grep -q "RHEL_RELEASE_VERSION(9,6)" "$DKMS_DIR/rc_init.c"; then
-        cd "$DKMS_DIR"
-        if grep -q "blk_queue_max_hw_sectors(sdev->request_queue, 256);" rc_init.c; then
-            sed -i '/blk_queue_max_hw_sectors(sdev->request_queue, 256);/c\
-#if defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9,6)\
-        sdev->host->max_sectors = 256;\
-#else\
-        blk_queue_max_hw_sectors(sdev->request_queue, 256);\
-#endif' rc_init.c
-        fi
-
-        if grep -q "blk_queue_virt_boundary(sdev->request_queue, NVME_CTRL_PAGE_SIZE - 1);" rc_init.c; then
-            sed -i '/blk_queue_virt_boundary(sdev->request_queue, NVME_CTRL_PAGE_SIZE - 1);/c\
-#if defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9,6)\
-    /* virt_boundary handled differently in RHEL 9.6+ */\
-#else\
-    blk_queue_virt_boundary(sdev->request_queue, NVME_CTRL_PAGE_SIZE - 1);\
-#endif' rc_init.c
-        fi
-        cd - > /dev/null
-        echo "  Patched rc_init.c"
-    fi
+    SRC_DIR="$orig_src_dir"
     
     # Patch mk_certs in DKMS dir
     patch_mk_certs "$DKMS_DIR"
@@ -851,170 +915,48 @@ EOF
         echo "  sudo mokutil --list-enrolled"
         echo ""
         echo "If the module fails to load, you may need to:"
-        echo "  1. Sign the module manually (use menu option 6)"
+        echo "  1. Sign the module manually (use menu option 8)"
         echo "  2. Enroll your signing key (use menu option 9)"
         echo ""
         read -p "Sign and enroll key now? (Y/n): " sign_now
         if [ "$sign_now" != "n" ] && [ "$sign_now" != "N" ]; then
-            # Find the DKMS-built module
-            local dkms_module=$(find /var/lib/dkms/rcraid -name "rcraid.ko" 2>/dev/null | head -1)
-            if [ -n "$dkms_module" ]; then
-                generate_signing_key
-                sign_module "$dkms_module"
-                
-                # Also sign the installed module
-                local installed=$(find_installed_module)
-                if [ -n "$installed" ] && [[ "$installed" != *.xz ]]; then
-                    sign_module "$installed"
-                fi
-                
-                enroll_mok_key
-            fi
+            generate_signing_key
+            sign_installed_module
+            enroll_mok_key
         fi
     fi
     
     return 0
 }
 
-sign_installed_module() {
-    check_root || return 1
-    
-    local installed=$(find_installed_module)
-    
-    if [ -z "$installed" ]; then
-        print_error "No installed module found!"
-        return 1
-    fi
-    
-    print_status "Found installed module: $installed"
-    
-    # Handle compressed modules
-    local module_to_sign="$installed"
-    local was_compressed=false
-    
-    if [[ "$installed" == *.xz ]]; then
-        print_status "Decompressing module..."
-        was_compressed=true
-        module_to_sign="${installed%.xz}"
-        xz -dk "$installed" -f
-    fi
-    
-    # Generate key if needed
-    if [ ! -f "$CERT_DIR/module_signing_key.der" ]; then
-        generate_signing_key || return 1
-    fi
-    
-    # Sign it
-    sign_module "$module_to_sign" || return 1
-    
-    # Recompress if needed
-    if [ "$was_compressed" = true ]; then
-        print_status "Recompressing module..."
-        xz -f "$module_to_sign"
-    fi
-    
-    # Update initramfs
-    print_status "Updating initramfs..."
-    dracut -f
-    
-    print_status "Installed module signed successfully!"
-    echo ""
-    echo "If this is a new signing key, you need to enroll it with MOK."
-    read -p "Enroll MOK key now? (Y/n): " enroll
-    if [ "$enroll" != "n" ] && [ "$enroll" != "N" ]; then
-        enroll_mok_key
-    fi
-    
-    return 0
-}
-
-try_load_module() {
-    check_root || return 1
-    
-    print_status "Attempting to load rcraid module..."
-    
-    # Unload if already loaded
-    if lsmod | grep -q "^rcraid"; then
-        print_status "Unloading existing module..."
-        modprobe -r rcraid 2>/dev/null || true
-    fi
-    
-    # Try to load
-    if modprobe rcraid; then
-        print_status "Module loaded successfully!"
-        echo ""
-        lsmod | grep rcraid
-        echo ""
-        
-        # Check for RAID devices
-        print_status "Checking for RAID devices..."
-        if ls /dev/sd* 2>/dev/null | grep -q sd; then
-            lsblk
-        else
-            print_warning "No block devices found. RAID array may need to be configured."
-        fi
-        return 0
-    else
-        print_error "Failed to load module!"
-        echo ""
-        echo "Check dmesg for errors:"
-        dmesg | tail -20
-        echo ""
-        
-        if check_secure_boot; then
-            echo -e "${YELLOW}Secure Boot is enabled.${NC}"
-            echo "The module may need to be signed and the key enrolled."
-            echo "Use menu options 6 and 9 to sign and enroll."
-        fi
-        return 1
-    fi
-}
-
-restore_original_files() {
-    check_driver_sdk || return 1
-    
-    print_status "Restoring original source files..."
-    
-    if [ -f "$SRC_DIR/rc_config.c.orig" ]; then
-        cp "$SRC_DIR/rc_config.c.orig" "$SRC_DIR/rc_config.c"
-        print_status "Restored rc_config.c"
-    else
-        print_warning "No backup found for rc_config.c"
-    fi
-    
-    if [ -f "$SRC_DIR/rc_init.c.orig" ]; then
-        cp "$SRC_DIR/rc_init.c.orig" "$SRC_DIR/rc_init.c"
-        print_status "Restored rc_init.c"
-    else
-        print_warning "No backup found for rc_init.c"
-    fi
-    
-    if [ -f "$DRIVER_SDK_DIR/mk_certs.orig" ]; then
-        cp "$DRIVER_SDK_DIR/mk_certs.orig" "$DRIVER_SDK_DIR/mk_certs"
-        print_status "Restored mk_certs"
-    else
-        print_warning "No backup found for mk_certs"
-    fi
-    
-    # Clean build artifacts
-    print_status "Cleaning build artifacts..."
-    cd "$SRC_DIR"
-    rm -f *.o *.ko .*.cmd .*.d 2>/dev/null || true
-    rm -f rcraid.mod.c Module.symvers Modules.symvers 2>/dev/null || true
-    rm -rf .tmp_versions Module.markers modules.order 2>/dev/null || true
-    cd - > /dev/null
-    
-    print_status "Original files restored!"
-    return 0
-}
+#######################################
+# RPM/ISO Build Functions (Dynamic!)
+#######################################
 
 build_driver_rpm() {
     print_status "Building Driver Update Disk RPM..."
     
-    local RELEASE="5.14.0.611.5.1.el9_7.x86_64"
+    # DYNAMIC: Generate release string from actual kernel version
+    local RELEASE=$(echo "$KVERS" | sed 's/-/./g')
     local ARCH="x86_64"
     local BUILD_ROOT="$HOME/rpmbuild"
     local MODULE_PATH=""
+    
+    # DYNAMIC: Detect OS info for RPM metadata
+    local OS_SUMMARY=""
+    local OS_DESC=""
+    
+    if [ "$RHEL_MAJOR" -ge 10 ]; then
+        OS_SUMMARY="AMD RAID driver for RHEL 10.x"
+        OS_DESC="This package provides the rcraid kernel module built for Linux kernel $KVERS (EL10) for the $ARCH family of processors."
+    else
+        OS_SUMMARY="AMD RAID driver for RHEL 9.x"
+        OS_DESC="This package provides the rcraid kernel module built for Linux kernel $KVERS (EL9) for the $ARCH family of processors."
+    fi
+    
+    print_status "Building for: $OS_NAME"
+    print_status "Kernel: $KVERS"
+    print_status "Release tag: $RELEASE"
     
     # Find the module
     MODULE_PATH=$(find_any_module)
@@ -1070,7 +1012,7 @@ build_driver_rpm() {
             sort -u)
     fi
     
-    # Create spec file
+    # Create spec file (FULLY DYNAMIC!)
     print_status "Creating RPM spec file..."
     cat > $BUILD_ROOT/SPECS/${DRIVER_NAME}.spec << SPEC
 # Disable debuginfo package - we're using pre-built binary module
@@ -1084,10 +1026,10 @@ build_driver_rpm() {
 Name:           kmod-%{kmod_name}
 Version:        %{kmod_version}
 Release:        ${RELEASE}
-Summary:        AMD RAID driver for RHEL 9.7
-License:        Dot Hill
+Summary:        ${OS_SUMMARY}
+License:        Proprietary (AMD)
 Group:          System Environment/Kernel
-URL:            http://www.kernel.org
+URL:            https://www.amd.com
 
 Source0:        %{kmod_name}-%{kmod_version}.tar.gz
 
@@ -1105,7 +1047,10 @@ Provides:       modalias(pci:v00001022d0000791[67]sv*sd*bc*sc*i*)
 Provides:       modalias(pci:v00001022d0000B000sv*sd*bc01sc08i02*)
 
 %description
-This package provides the rcraid kernel modules built for the Linux kernel 5.14.0-427.13.1.el9_4.x86_64 for the x86_64 family of processors.
+${OS_DESC}
+
+Built on: $(date)
+Built by: $(whoami)@$(hostname)
 
 %prep
 %setup -q -n %{kmod_name}-%{kmod_version}
@@ -1161,9 +1106,10 @@ fi
 %config(noreplace) /etc/modules-load.d/%{kmod_name}.conf
 
 %changelog
-* $(date "+%a %b %d %Y") Builder <builder@localhost> - ${DRIVER_VERSION}-${RELEASE}
-- Initial RPM build for RHEL/Alma 9.x
-- Patched for kernel 5.14.0-570+ compatibility (blk_queue functions)
+* $(date "+%a %b %d %Y") $(whoami)@$(hostname) - ${DRIVER_VERSION}-${RELEASE}
+- Built for ${OS_NAME}
+- Kernel: ${KVERS}
+- Patched for compatibility with kernel ${KERNEL_VERSION}
 SPEC
 
     # Build the RPM
@@ -1229,7 +1175,7 @@ build_driver_iso() {
     createrepo_c . 2>/dev/null || createrepo .
     cd - > /dev/null
     
-    # Create ISO
+    # Create ISO - DYNAMIC naming
     local ISO_NAME="rcraid-${DRIVER_VERSION}-${KVERS}.iso"
     
     # Find an ISO creation tool
@@ -1265,7 +1211,7 @@ build_driver_iso() {
         echo ""
         echo -e "${GREEN}Method 1: Boot with inst.dd (specify location)${NC}"
         echo "  1. Copy ISO to USB drive"
-        echo "  2. Boot Alma/RHEL installer"
+        echo "  2. Boot installer"
         echo "  3. At boot menu, press Tab/e to edit"
         echo "  4. Add: inst.dd=hd:LABEL=<usb-label>:/$ISO_NAME"
         echo ""
@@ -1286,6 +1232,181 @@ build_driver_iso() {
         print_error "ISO creation failed!"
         return 1
     fi
+}
+
+#######################################
+# Utility Functions
+#######################################
+
+try_load_module() {
+    check_root || return 1
+    
+    print_status "Attempting to load rcraid module..."
+    
+    # Unload if already loaded
+    if lsmod | grep -q "^rcraid"; then
+        print_status "Unloading existing module..."
+        modprobe -r rcraid 2>/dev/null || true
+    fi
+    
+    # Try to load
+    if modprobe rcraid; then
+        print_status "Module loaded successfully!"
+        echo ""
+        lsmod | grep rcraid
+        echo ""
+        
+        # Check for RAID devices
+        print_status "Checking for RAID devices..."
+        if ls /dev/sd* 2>/dev/null | grep -q sd; then
+            lsblk
+        else
+            print_warning "No block devices found. RAID array may need to be configured."
+        fi
+        return 0
+    else
+        print_error "Failed to load module!"
+        echo ""
+        echo "Check dmesg for errors:"
+        dmesg | tail -20
+        echo ""
+        
+        if check_secure_boot; then
+            echo -e "${YELLOW}Secure Boot is enabled.${NC}"
+            echo "The module may need to be signed and the key enrolled."
+            echo "Use menu options 8 and 9 to sign and enroll."
+        fi
+        return 1
+    fi
+}
+
+restore_original_files() {
+    check_driver_sdk || return 1
+    
+    print_status "Restoring original source files..."
+    
+    if [ -f "$SRC_DIR/rc_config.c.orig" ]; then
+        cp "$SRC_DIR/rc_config.c.orig" "$SRC_DIR/rc_config.c"
+        print_status "Restored rc_config.c"
+    else
+        print_warning "No backup found for rc_config.c"
+    fi
+    
+    if [ -f "$SRC_DIR/rc_init.c.orig" ]; then
+        cp "$SRC_DIR/rc_init.c.orig" "$SRC_DIR/rc_init.c"
+        print_status "Restored rc_init.c"
+    else
+        print_warning "No backup found for rc_init.c"
+    fi
+    
+    if [ -f "$DRIVER_SDK_DIR/mk_certs.orig" ]; then
+        cp "$DRIVER_SDK_DIR/mk_certs.orig" "$DRIVER_SDK_DIR/mk_certs"
+        print_status "Restored mk_certs"
+    else
+        print_warning "No backup found for mk_certs"
+    fi
+    
+    # Clean build artifacts
+    print_status "Cleaning build artifacts..."
+    cd "$SRC_DIR"
+    rm -f *.o *.ko .*.cmd .*.d 2>/dev/null || true
+    rm -f rcraid.mod.c Module.symvers Modules.symvers 2>/dev/null || true
+    rm -rf .tmp_versions Module.markers modules.order 2>/dev/null || true
+    cd - > /dev/null
+    
+    print_status "Original files restored!"
+    return 0
+}
+
+#######################################
+# Status Display
+#######################################
+
+show_system_status() {
+    echo ""
+    echo -e "${BLUE}=== System Status ===${NC}"
+    echo ""
+    echo -e "OS:             ${CYAN}$OS_NAME${NC}"
+    echo -e "OS ID:          $OS_ID $OS_VERSION_ID"
+    echo -e "RHEL Major:     ${CYAN}$RHEL_MAJOR${NC}"
+    echo -e "Kernel Version: ${CYAN}$KVERS${NC}"
+    echo -e "Kernel Series:  $KERNEL_VERSION"
+    
+    # Secure Boot status
+    if check_secure_boot; then
+        echo -e "Secure Boot:    ${YELLOW}ENABLED${NC} (module signing required)"
+    else
+        echo -e "Secure Boot:    ${GREEN}DISABLED${NC}"
+    fi
+    
+    # kernel-devel status
+    if [ -n "$KERNEL_SRC_DIR" ] && [ -d "$KERNEL_SRC_DIR" ]; then
+        echo -e "Kernel Devel:   ${GREEN}INSTALLED${NC}"
+    else
+        echo -e "Kernel Devel:   ${RED}NOT INSTALLED${NC}"
+    fi
+    
+    # Driver SDK status
+    if [ -d "$DRIVER_SDK_DIR" ]; then
+        echo -e "Driver SDK:     ${GREEN}FOUND${NC}"
+        if is_patches_applied; then
+            echo -e "Source Patches: ${GREEN}APPLIED${NC}"
+        else
+            echo -e "Source Patches: ${YELLOW}NOT APPLIED${NC}"
+        fi
+        if is_mk_certs_patched; then
+            echo -e "mk_certs Patch: ${GREEN}APPLIED${NC}"
+        else
+            echo -e "mk_certs Patch: ${YELLOW}NOT APPLIED${NC}"
+        fi
+    else
+        echo -e "Driver SDK:     ${RED}NOT FOUND${NC}"
+    fi
+    
+    # Built module status
+    if [ -f "$SRC_DIR/rcraid.ko" ]; then
+        echo -e "Built Module:   ${GREEN}FOUND${NC} ($SRC_DIR/rcraid.ko)"
+        if is_module_signed "$SRC_DIR/rcraid.ko"; then
+            echo -e "Module Signed:  ${GREEN}YES${NC}"
+        else
+            echo -e "Module Signed:  ${YELLOW}NO${NC}"
+        fi
+    else
+        echo -e "Built Module:   ${YELLOW}NOT BUILT${NC}"
+    fi
+    
+    # Installed module status
+    local installed=$(find_installed_module)
+    if [ -n "$installed" ]; then
+        echo -e "Installed:      ${GREEN}YES${NC} ($installed)"
+        if is_module_signed "$installed"; then
+            echo -e "Inst. Signed:   ${GREEN}YES${NC}"
+        else
+            echo -e "Inst. Signed:   ${YELLOW}NO${NC}"
+        fi
+    else
+        echo -e "Installed:      ${YELLOW}NO${NC}"
+    fi
+    
+    # Module loaded status
+    if lsmod | grep -q "^rcraid"; then
+        echo -e "Module Loaded:  ${GREEN}YES${NC}"
+    else
+        echo -e "Module Loaded:  ${YELLOW}NO${NC}"
+    fi
+    
+    # DKMS status
+    if command -v dkms &> /dev/null; then
+        if dkms status 2>/dev/null | grep -q "$DRIVER_NAME"; then
+            echo -e "DKMS Status:    ${GREEN}CONFIGURED${NC}"
+        else
+            echo -e "DKMS Status:    ${YELLOW}NOT CONFIGURED${NC}"
+        fi
+    else
+        echo -e "DKMS Status:    ${YELLOW}NOT INSTALLED${NC}"
+    fi
+    
+    echo ""
 }
 
 #######################################
@@ -1399,5 +1520,7 @@ main() {
     done
 }
 
-# Run main function
-main
+# Run main if not sourced
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
