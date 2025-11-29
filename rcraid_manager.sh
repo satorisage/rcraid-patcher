@@ -933,41 +933,216 @@ EOF
 # RPM/ISO Build Functions (Dynamic!)
 #######################################
 
+# Global variable to track selected kernel for RPM/ISO builds
+SELECTED_KERNEL=""
+
+# List available kernels with kernel-devel installed
+list_available_kernels() {
+    local kernels=()
+    local i=1
+    
+    # Find all kernel-devel installations
+    for kdir in /usr/src/kernels/*/; do
+        if [ -d "$kdir" ]; then
+            local kver=$(basename "$kdir")
+            kernels+=("$kver")
+        fi
+    done
+    
+    if [ ${#kernels[@]} -eq 0 ]; then
+        print_error "No kernel-devel packages found!"
+        echo "Install kernel-devel with: sudo dnf install kernel-devel"
+        return 1
+    fi
+    
+    echo ""
+    echo -e "${BLUE}=== Available Kernels (with kernel-devel) ===${NC}"
+    echo ""
+    
+    for kver in "${kernels[@]}"; do
+        local marker=""
+        if [ "$kver" = "$KVERS" ]; then
+            marker="${GREEN}(current)${NC}"
+        fi
+        echo "  $i) $kver $marker"
+        ((i++))
+    done
+    
+    echo ""
+    echo "  0) Enter custom kernel version"
+    echo ""
+    
+    # Return kernels array via global
+    AVAILABLE_KERNELS=("${kernels[@]}")
+    return 0
+}
+
+# Prompt user to select a kernel version for RPM/ISO building
+select_kernel_for_build() {
+    list_available_kernels || return 1
+    
+    local num_kernels=${#AVAILABLE_KERNELS[@]}
+    
+    while true; do
+        read -p "Select kernel to build for [1-$num_kernels, or 0 for custom] (default: current): " selection
+        
+        # Default to current kernel
+        if [ -z "$selection" ]; then
+            SELECTED_KERNEL="$KVERS"
+            print_status "Using current kernel: $SELECTED_KERNEL"
+            return 0
+        fi
+        
+        # Custom kernel entry
+        if [ "$selection" = "0" ]; then
+            read -p "Enter kernel version (e.g., 5.14.0-503.14.1.el9_5.x86_64): " custom_kernel
+            if [ -z "$custom_kernel" ]; then
+                print_error "No kernel version entered"
+                continue
+            fi
+            # Verify kernel-devel exists for this version
+            if [ ! -d "/usr/src/kernels/$custom_kernel" ]; then
+                print_warning "kernel-devel not found for $custom_kernel"
+                read -p "Continue anyway? (y/N): " cont
+                if [ "$cont" != "y" ] && [ "$cont" != "Y" ]; then
+                    continue
+                fi
+            fi
+            SELECTED_KERNEL="$custom_kernel"
+            print_status "Using custom kernel: $SELECTED_KERNEL"
+            return 0
+        fi
+        
+        # Validate numeric selection
+        if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "$num_kernels" ]; then
+            SELECTED_KERNEL="${AVAILABLE_KERNELS[$((selection-1))]}"
+            print_status "Selected kernel: $SELECTED_KERNEL"
+            return 0
+        fi
+        
+        print_error "Invalid selection. Please enter 1-$num_kernels or 0 for custom."
+    done
+}
+
 build_driver_rpm() {
     print_status "Building Driver Update Disk RPM..."
     
-    # DYNAMIC: Generate release string from actual kernel version
-    local RELEASE=$(echo "$KVERS" | sed 's/-/./g')
+    # Prompt for kernel selection
+    echo ""
+    echo -e "${CYAN}You can build the RPM for any kernel with kernel-devel installed.${NC}"
+    echo -e "${CYAN}This allows creating driver disks for installation media that use${NC}"
+    echo -e "${CYAN}a different kernel version than your running system.${NC}"
+    echo ""
+    
+    select_kernel_for_build || return 1
+    
+    local TARGET_KVERS="$SELECTED_KERNEL"
+    
+    # DYNAMIC: Generate release string from target kernel version
+    local RELEASE=$(echo "$TARGET_KVERS" | sed 's/-/./g')
     local ARCH="x86_64"
     local BUILD_ROOT="$HOME/rpmbuild"
     local MODULE_PATH=""
+    
+    # Detect RHEL version from target kernel
+    local TARGET_RHEL_MAJOR="$RHEL_MAJOR"
+    if [[ "$TARGET_KVERS" == 6.* ]]; then
+        TARGET_RHEL_MAJOR=10
+    elif [[ "$TARGET_KVERS" == 5.* ]]; then
+        TARGET_RHEL_MAJOR=9
+    fi
     
     # DYNAMIC: Detect OS info for RPM metadata
     local OS_SUMMARY=""
     local OS_DESC=""
     
-    if [ "$RHEL_MAJOR" -ge 10 ]; then
+    if [ "$TARGET_RHEL_MAJOR" -ge 10 ]; then
         OS_SUMMARY="AMD RAID driver for RHEL 10.x"
-        OS_DESC="This package provides the rcraid kernel module built for Linux kernel $KVERS (EL10) for the $ARCH family of processors."
+        OS_DESC="This package provides the rcraid kernel module built for Linux kernel $TARGET_KVERS (EL10) for the $ARCH family of processors."
     else
         OS_SUMMARY="AMD RAID driver for RHEL 9.x"
-        OS_DESC="This package provides the rcraid kernel module built for Linux kernel $KVERS (EL9) for the $ARCH family of processors."
+        OS_DESC="This package provides the rcraid kernel module built for Linux kernel $TARGET_KVERS (EL9) for the $ARCH family of processors."
     fi
     
     print_status "Building for: $OS_NAME"
-    print_status "Kernel: $KVERS"
+    print_status "Target kernel: $TARGET_KVERS"
     print_status "Release tag: $RELEASE"
     
-    # Find the module
-    MODULE_PATH=$(find_any_module)
+    # Check if we need to build a new module for this kernel
+    local need_build=1
     
-    if [ -z "$MODULE_PATH" ]; then
-        print_warning "No module found. Building one first..."
+    # Check for existing module in various locations
+    if [ -f "$SRC_DIR/rcraid.ko" ]; then
+        # Verify the module was built for our target kernel
+        local mod_vermagic=$(modinfo -F vermagic "$SRC_DIR/rcraid.ko" 2>/dev/null | awk '{print $1}')
+        if [ "$mod_vermagic" = "$TARGET_KVERS" ]; then
+            MODULE_PATH="$SRC_DIR/rcraid.ko"
+            need_build=0
+            print_status "Found existing module built for $TARGET_KVERS"
+        fi
+    fi
+    
+    # Check DKMS for pre-built module
+    if [ $need_build -eq 1 ]; then
+        local dkms_module="/var/lib/dkms/rcraid/$DRIVER_VERSION/$TARGET_KVERS/x86_64/module/rcraid.ko"
+        if [ -f "$dkms_module" ]; then
+            MODULE_PATH="$dkms_module"
+            need_build=0
+            print_status "Found DKMS module for $TARGET_KVERS"
+        fi
+    fi
+    
+    # Check installed modules
+    if [ $need_build -eq 1 ]; then
+        for ext in "" ".xz" ".gz"; do
+            local installed_mod="/lib/modules/$TARGET_KVERS/extra/rcraid.ko$ext"
+            if [ -f "$installed_mod" ]; then
+                MODULE_PATH="$installed_mod"
+                need_build=0
+                print_status "Found installed module for $TARGET_KVERS"
+                break
+            fi
+        done
+    fi
+    
+    # Need to build a new module
+    if [ $need_build -eq 1 ]; then
+        print_warning "No pre-built module found for $TARGET_KVERS"
+        
+        # Check if kernel-devel is available for target
+        if [ ! -d "/usr/src/kernels/$TARGET_KVERS" ]; then
+            print_error "kernel-devel not installed for $TARGET_KVERS"
+            echo "Install with: sudo dnf install kernel-devel-$TARGET_KVERS"
+            return 1
+        fi
+        
+        print_status "Building module for $TARGET_KVERS..."
+        
         check_driver_sdk || return 1
-        check_kernel_devel || return 1
-        apply_patches || return 1
-        build_module || return 1
+        
+        # Apply patches if needed
+        if ! is_patches_applied; then
+            apply_patches || return 1
+        fi
+        
+        # Create symlink for binary blob
+        cd "$SRC_DIR"
+        if [ ! -e rcblob.x86_64.o ]; then
+            ln -sf rcblob.x86_64 rcblob.x86_64.o
+        fi
+        cd - > /dev/null
+        
+        # Build for target kernel
+        print_status "Compiling module for kernel $TARGET_KVERS..."
+        make -C /usr/src/kernels/$TARGET_KVERS M="$SRC_DIR" modules
+        
+        if [ ! -f "$SRC_DIR/rcraid.ko" ]; then
+            print_error "Build failed!"
+            return 1
+        fi
+        
         MODULE_PATH="$SRC_DIR/rcraid.ko"
+        print_status "Build successful!"
     fi
     
     print_status "Using module: $MODULE_PATH"
@@ -977,11 +1152,22 @@ build_driver_rpm() {
         print_status "Decompressing module..."
         xz -dk "$MODULE_PATH" -c > /tmp/rcraid.ko
         MODULE_PATH="/tmp/rcraid.ko"
+    elif [[ "$MODULE_PATH" == *.gz ]]; then
+        print_status "Decompressing module..."
+        gzip -dk "$MODULE_PATH" -c > /tmp/rcraid.ko
+        MODULE_PATH="/tmp/rcraid.ko"
     fi
     
     # Install build dependencies
     print_status "Installing build dependencies..."
-    dnf install -y rpm-build rpmdevtools createrepo_c genisoimage 2>/dev/null || true
+    dnf install -y rpm-build rpmdevtools createrepo_c 2>/dev/null || true
+    
+    # Install ISO tools based on RHEL version
+    if [ "$RHEL_MAJOR" -ge 10 ]; then
+        dnf install -y xorriso 2>/dev/null || true
+    else
+        dnf install -y genisoimage 2>/dev/null || true
+    fi
     
     # Setup RPM build environment
     rm -f $BUILD_ROOT/RPMS/x86_64/kmod-rcraid*.rpm 2>/dev/null || true
@@ -1021,7 +1207,7 @@ build_driver_rpm() {
 
 %define kmod_name rcraid
 %define kmod_version ${DRIVER_VERSION}
-%define kernel_version ${KVERS}
+%define kernel_version ${TARGET_KVERS}
 
 Name:           kmod-%{kmod_name}
 Version:        %{kmod_version}
@@ -1051,6 +1237,7 @@ ${OS_DESC}
 
 Built on: $(date)
 Built by: $(whoami)@$(hostname)
+Target kernel: ${TARGET_KVERS}
 
 %prep
 %setup -q -n %{kmod_name}-%{kmod_version}
@@ -1108,8 +1295,8 @@ fi
 %changelog
 * $(date "+%a %b %d %Y") $(whoami)@$(hostname) - ${DRIVER_VERSION}-${RELEASE}
 - Built for ${OS_NAME}
-- Kernel: ${KVERS}
-- Patched for compatibility with kernel ${KERNEL_VERSION}
+- Target kernel: ${TARGET_KVERS}
+- Patched for compatibility
 SPEC
 
     # Build the RPM
@@ -1122,14 +1309,15 @@ SPEC
     if [ -f "$RPM_FILE" ]; then
         print_status "RPM built successfully!"
         
-        # Copy RPM to home directory
-        cp "$RPM_FILE" "$HOME/"
+        # Copy RPM to home directory with descriptive name
+        local FINAL_RPM_NAME="kmod-rcraid-${DRIVER_VERSION}-${TARGET_KVERS}.rpm"
+        cp "$RPM_FILE" "$HOME/$FINAL_RPM_NAME"
         
         echo ""
-        print_status "RPM created: $HOME/$(basename $RPM_FILE)"
+        print_status "RPM created: $HOME/$FINAL_RPM_NAME"
         echo ""
         echo "To install on an existing system:"
-        echo "  sudo rpm -ivh $HOME/$(basename $RPM_FILE)"
+        echo "  sudo rpm -ivh $HOME/$FINAL_RPM_NAME"
         echo ""
         
         return 0
@@ -1142,7 +1330,7 @@ SPEC
 build_driver_iso() {
     print_status "Building Driver Update Disk ISO..."
     
-    # First build the RPM
+    # First build the RPM (will prompt for kernel selection)
     build_driver_rpm || return 1
     
     local BUILD_ROOT="$HOME/rpmbuild"
@@ -1153,9 +1341,13 @@ build_driver_iso() {
         return 1
     fi
     
-    # Install ISO creation tools
+    # Install ISO creation tools based on RHEL version
     print_status "Installing ISO creation tools..."
-    dnf install -y createrepo_c genisoimage 2>/dev/null || true
+    if [ "$RHEL_MAJOR" -ge 10 ]; then
+        dnf install -y createrepo_c xorriso 2>/dev/null || true
+    else
+        dnf install -y createrepo_c genisoimage 2>/dev/null || true
+    fi
     
     print_status "Creating Driver Update Disk ISO..."
     
@@ -1170,33 +1362,59 @@ build_driver_iso() {
     # Create rhdd3 file (identifies this as a driver disk)
     echo -e "Driver Update Disk version 3\n" > $DUD_DIR/rhdd3
     
+    # Create empty ks.cfg stub to prevent "can't find ks.cfg" warnings
+    # Anaconda sometimes interprets the DUD drive as a kickstart source
+    cat > $DUD_DIR/ks.cfg << 'KSCFG'
+# Stub kickstart file for AMD rcraid Driver Update Disk
+# This file exists to prevent "can't find ks.cfg" warnings during inst.dd
+# It contains no actual kickstart configuration
+KSCFG
+    
     # Create repo metadata
     cd $DUD_DIR/rpms/x86_64
     createrepo_c . 2>/dev/null || createrepo .
     cd - > /dev/null
     
-    # Create ISO - DYNAMIC naming
-    local ISO_NAME="rcraid-${DRIVER_VERSION}-${KVERS}.iso"
+    # Create ISO - use the target kernel version from RPM build
+    local TARGET_KVERS="${SELECTED_KERNEL:-$KVERS}"
+    local ISO_NAME="rcraid-${DRIVER_VERSION}-${TARGET_KVERS}.iso"
+    local ISO_PATH="$HOME/$ISO_NAME"
     
-    # Find an ISO creation tool
-    local ISO_TOOL=""
-    if which genisoimage >/dev/null 2>&1; then
-        ISO_TOOL="genisoimage"
-    elif which mkisofs >/dev/null 2>&1; then
-        ISO_TOOL="mkisofs"
+    # OEMDRV is the magic label that Anaconda auto-detects for driver disks
+    local VOLUME_LABEL="OEMDRV"
+    
+    print_status "Creating ISO with volume label: $VOLUME_LABEL"
+    
+    # Determine which ISO tool to use and create the ISO
+    if command -v xorriso >/dev/null 2>&1; then
+        # Use xorriso native syntax for cleaner output
+        print_status "Using xorriso (native mode)..."
+        xorriso -outdev "$ISO_PATH" \
+            -volid "$VOLUME_LABEL" \
+            -joliet on \
+            -rockridge on \
+            -map "$DUD_DIR" / \
+            -commit
+    elif command -v genisoimage >/dev/null 2>&1; then
+        print_status "Using genisoimage..."
+        genisoimage -o "$ISO_PATH" -R -J -V "$VOLUME_LABEL" "$DUD_DIR"
+    elif command -v mkisofs >/dev/null 2>&1; then
+        print_status "Using mkisofs..."
+        mkisofs -o "$ISO_PATH" -R -J -V "$VOLUME_LABEL" "$DUD_DIR"
     else
         print_error "No ISO creation tool found!"
-        echo "Please install genisoimage: sudo dnf install genisoimage"
+        if [ "$RHEL_MAJOR" -ge 10 ]; then
+            echo "Please install xorriso: sudo dnf install xorriso"
+        else
+            echo "Please install genisoimage: sudo dnf install genisoimage"
+        fi
         rm -rf $DUD_DIR
         return 1
     fi
     
-    print_status "Creating ISO with $ISO_TOOL..."
-    $ISO_TOOL -o "$HOME/$ISO_NAME" -R -J -V "RCRAID_DUD" $DUD_DIR
-    
     rm -rf $DUD_DIR
     
-    if [ -f "$HOME/$ISO_NAME" ]; then
+    if [ -f "$ISO_PATH" ]; then
         echo ""
         print_status "Driver Update Disk ISO created successfully!"
         echo ""
@@ -1205,26 +1423,34 @@ build_driver_iso() {
         echo -e "${BLUE}=============================================${NC}"
         echo ""
         echo "  - $(basename $RPM_FILE)"
-        echo "  - $ISO_NAME"
+        echo "  - $ISO_NAME (Volume Label: $VOLUME_LABEL)"
         echo ""
         echo -e "${BLUE}=== USAGE INSTRUCTIONS ===${NC}"
         echo ""
-        echo -e "${GREEN}Method 1: Boot with inst.dd (specify location)${NC}"
+        echo -e "${GREEN}Method 1: Automatic detection (recommended)${NC}"
+        echo "  The ISO is labeled 'OEMDRV' which Anaconda auto-detects."
+        echo "  1. Write ISO to USB or make available via HTTP"
+        echo "  2. Boot installer normally - driver loads automatically"
+        echo ""
+        echo -e "${GREEN}Method 2: Boot with inst.dd (explicit)${NC}"
         echo "  1. Copy ISO to USB drive"
         echo "  2. Boot installer"
         echo "  3. At boot menu, press Tab/e to edit"
-        echo "  4. Add: inst.dd=hd:LABEL=<usb-label>:/$ISO_NAME"
+        echo "  4. Add: inst.dd=hd:LABEL=OEMDRV:/$ISO_NAME"
         echo ""
-        echo -e "${GREEN}Method 2: Interactive driver disk${NC}"
+        echo -e "${GREEN}Method 3: Interactive driver disk${NC}"
         echo "  1. Boot installer with: inst.dd"
         echo "  2. When prompted, select the drive with the ISO"
         echo ""
-        echo -e "${GREEN}Method 3: HTTP server${NC}"
+        echo -e "${GREEN}Method 4: HTTP server${NC}"
         echo "  1. Host ISO on web server"
         echo "  2. Boot with: inst.dd=http://server/$ISO_NAME"
         echo ""
-        echo -e "${GREEN}Method 4: Install on existing system${NC}"
+        echo -e "${GREEN}Method 5: Install on existing system${NC}"
         echo "  sudo rpm -ivh $HOME/$(basename $RPM_FILE)"
+        echo ""
+        echo -e "${CYAN}Note: The ISO includes a stub ks.cfg file to prevent${NC}"
+        echo -e "${CYAN}'can't find ks.cfg' warnings during installation.${NC}"
         echo ""
         
         return 0
@@ -1404,6 +1630,23 @@ show_system_status() {
         fi
     else
         echo -e "DKMS Status:    ${YELLOW}NOT INSTALLED${NC}"
+    fi
+    
+    # Available kernels for building
+    local kernel_count=$(ls -d /usr/src/kernels/*/ 2>/dev/null | wc -l)
+    if [ "$kernel_count" -gt 0 ]; then
+        echo -e "Build Targets:  ${GREEN}$kernel_count kernel(s) available${NC}"
+    else
+        echo -e "Build Targets:  ${RED}NO kernel-devel installed${NC}"
+    fi
+    
+    # ISO tools status
+    if command -v xorriso &> /dev/null; then
+        echo -e "ISO Tool:       ${GREEN}xorriso${NC}"
+    elif command -v genisoimage &> /dev/null; then
+        echo -e "ISO Tool:       ${GREEN}genisoimage${NC}"
+    else
+        echo -e "ISO Tool:       ${YELLOW}NOT INSTALLED${NC}"
     fi
     
     echo ""

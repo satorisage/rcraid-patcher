@@ -152,7 +152,20 @@ sudo ./rcraid_manager.sh
 # Select option 13: "Build RPM package"
 ```
 
-The RPM will be created in your home directory with dynamic naming based on your kernel version.
+### Kernel Selection
+
+When building an RPM, you can choose which kernel version to target:
+
+- **Current kernel** - Build for the running kernel (default)
+- **Other installed kernels** - Build for any kernel with kernel-devel installed
+- **Custom kernel** - Manually specify a kernel version
+
+This is useful when:
+- Creating a driver disk for installation media that uses a different kernel
+- Your system has been updated but you need a driver for the original install kernel
+- Building for multiple kernel versions
+
+The script will automatically detect available kernel-devel installations and let you choose.
 
 ## Driver Update Disk for Fresh Installs
 
@@ -163,17 +176,43 @@ sudo ./rcraid_manager.sh
 # Select option 14: "Build Driver Update Disk ISO"
 ```
 
-Then boot the installer with:
+### ISO Creation Tools
 
+The script automatically uses the appropriate ISO creation tool:
+- **RHEL 10.x**: Uses `xorriso` in native mode (genisoimage is not available)
+- **RHEL 9.x**: Uses `genisoimage` or `mkisofs`
+
+The xorriso tool is used with its native syntax (not mkisofs emulation) for cleaner output and better compatibility.
+
+If needed, install manually:
+```bash
+# RHEL 10.x
+sudo dnf install xorriso
+
+# RHEL 9.x
+sudo dnf install genisoimage
 ```
-inst.dd=hd:LABEL=<usb-label>:/rcraid-9.3.3-<kernel>.iso
+
+### Using the Driver Disk
+
+The ISO is created with the volume label `OEMDRV`, which Anaconda (the RHEL installer) automatically detects and loads. This means in many cases, simply having the ISO available will auto-load the driver.
+
+**Method 1: Automatic detection (recommended)**
+```
+# Just boot normally with the ISO accessible - Anaconda finds OEMDRV automatically
 ```
 
-Or interactively:
+**Method 2: Explicit boot parameter**
+```
+inst.dd=hd:LABEL=OEMDRV:/rcraid-9.3.3-<kernel>.iso
+```
 
+**Method 3: Interactive**
 ```
 inst.dd
 ```
+
+> **Note:** The ISO includes a stub `ks.cfg` file to prevent "can't find ks.cfg" warnings that can appear when Anaconda interprets the driver disk as a potential kickstart source. This warning is harmless but the stub file suppresses it for a cleaner installation experience.
 
 ## Troubleshooting
 
